@@ -1,30 +1,34 @@
 # FitForge CD Pipeline — ArgoCD + GitOps Complete Walkthrough
 
-> **Audience**: You (Aswin), implementing CD for FitForge's multi-repo microservices  
+> **Audience**: Aswin — implementing CD for FitForge's multi-repo microservices  
 > **Stack**: GitHub Actions → Docker Hub → Helm Charts Repo → ArgoCD → Kubernetes  
-> **Org**: `fitforge101`
+> **Org**: `fitforge101`  
+> **Infrastructure**: AWS EC2 — 1 Master Node + 2 Worker Nodes — kubeadm — Envoy Gateway
 
 ---
 
 ## Table of Contents
 
 1. [Architecture Overview](#1-architecture-overview)
-2. [Repository Layout](#2-repository-layout)
-3. [Prerequisites](#3-prerequisites)
-4. [Part 1 — Install ArgoCD on Kubernetes](#4-part-1--install-argocd-on-kubernetes)
-5. [Part 2 — Access the ArgoCD Dashboard](#5-part-2--access-the-argocd-dashboard)
-6. [Part 3 — ArgoCD CLI Setup](#6-part-3--argocd-cli-setup)
-7. [Part 4 — OIDC / SSO with GitHub (Dex)](#7-part-4--oidc--sso-with-github-dex)
-8. [Part 5 — RBAC (Role-Based Access Control)](#8-part-5--rbac-role-based-access-control)
-9. [Part 6 — GitHub Actions CD Workflow](#9-part-6--github-actions-cd-workflow)
-10. [Part 7 — Helm Charts Repo Structure](#10-part-7--helm-charts-repo-structure)
-11. [Part 8 — ArgoCD Application Manifests](#11-part-8--argocd-application-manifests)
-12. [Part 9 — App of Apps Pattern](#12-part-9--app-of-apps-pattern)
-13. [Part 10 — ArgoCD Image Updater (Alternative)](#13-part-10--argocd-image-updater-alternative)
-14. [Part 11 — Deployment Strategies](#14-part-11--deployment-strategies)
-15. [Part 12 — End-to-End Flow Walkthrough](#15-part-12--end-to-end-flow-walkthrough)
-16. [Troubleshooting](#16-troubleshooting)
-17. [Best Practices Checklist](#17-best-practices-checklist)
+2. [Your Infrastructure](#2-your-infrastructure)
+3. [Repository Layout](#3-repository-layout)
+4. [Multi-Environment Strategy (Dev & Prod)](#4-multi-environment-strategy-dev--prod)
+5. [Prerequisites](#5-prerequisites)
+6. [Part 1 — Install ArgoCD on Your kubeadm Cluster](#6-part-1--install-argocd-on-your-kubeadm-cluster)
+7. [Part 2 — Access the ArgoCD Dashboard](#7-part-2--access-the-argocd-dashboard)
+8. [Part 3 — ArgoCD CLI Setup (On Master Node)](#8-part-3--argocd-cli-setup-on-master-node)
+9. [Part 4 — OIDC / SSO with GitHub (Dex)](#9-part-4--oidc--sso-with-github-dex)
+10. [Part 5 — RBAC (Role-Based Access Control)](#10-part-5--rbac-role-based-access-control)
+11. [Part 6 — Helm Charts Repo Structure (Multi-Environment)](#11-part-6--helm-charts-repo-structure-multi-environment)
+12. [Part 7 — Validating Helm Charts Before Deploying](#12-part-7--validating-helm-charts-before-deploying)
+13. [Part 8 — ArgoCD Application Manifests (Dev & Prod)](#13-part-8--argocd-application-manifests-dev--prod)
+14. [Part 9 — App of Apps Pattern](#14-part-9--app-of-apps-pattern)
+15. [Part 10 — GitHub Actions CD Workflow](#15-part-10--github-actions-cd-workflow)
+16. [Part 11 — ArgoCD Image Updater (Alternative)](#16-part-11--argocd-image-updater-alternative)
+17. [Part 12 — Deployment Strategies](#17-part-12--deployment-strategies)
+18. [Part 13 — End-to-End Flow Walkthrough](#18-part-13--end-to-end-flow-walkthrough)
+19. [Troubleshooting](#19-troubleshooting)
+20. [Best Practices Checklist](#20-best-practices-checklist)
 
 ---
 
@@ -38,7 +42,7 @@ flowchart LR
         A["Push Code"]
     end
 
-    subgraph CI["GitHub Actions — CI (Service Repo)"]
+    subgraph CI["GitHub Actions — CI"]
         B["Checkout Code"]
         C["SAST + Snyk"]
         D["Install Deps + Build"]
@@ -47,18 +51,18 @@ flowchart LR
         G["Push to Docker Hub"]
     end
 
-    subgraph CD["GitHub Actions — CD (Service Repo)"]
+    subgraph CD["GitHub Actions — CD"]
         H["Checkout Helm Repo"]
-        I["Update image tag in values.yaml"]
-        J["Commit + Push to Helm Repo"]
+        I["Update image tag"]
+        J["Commit + Push"]
     end
 
-    subgraph GITOPS["ArgoCD (Kubernetes)"]
+    subgraph GITOPS["ArgoCD"]
         K["Detect Git Change"]
         L["Sync to Cluster"]
     end
 
-    subgraph K8S["Kubernetes Cluster"]
+    subgraph K8S["kubeadm Cluster on EC2"]
         M["Pull New Image"]
         N["Rolling Update Pods"]
     end
@@ -78,9 +82,51 @@ ArgoCD handles the rest — pulling manifests from Git and applying them to the 
 
 ---
 
-## 2. Repository Layout
+## 2. Your Infrastructure
 
-Your multi-repo organization should look like this:
+This walkthrough is tailored for your exact setup:
+
+```mermaid
+graph TB
+    subgraph AWS["AWS EC2 Instances"]
+        MASTER["Master Node (EC2)\n• kubeadm control plane\n• kubectl + helm + argocd CLI\n• Git clone of repos\n• Your 'workbench'"]
+        WORKER1["Worker Node 1 (EC2)\n• Runs application pods\n• Runs ArgoCD pods"]
+        WORKER2["Worker Node 2 (EC2)\n• Runs application pods\n• Runs ArgoCD pods"]
+    end
+
+    subgraph NETWORKING["Networking"]
+        HAPROXY["HAProxy (Dedicated EC2)\n• Load Balancer"]
+        ENVOY["Envoy Gateway\n• Running inside cluster\n• Routes to services"]
+    end
+
+    HAPROXY --> MASTER
+    MASTER --> WORKER1
+    MASTER --> WORKER2
+    ENVOY --> WORKER1
+    ENVOY --> WORKER2
+```
+
+### Key Facts About Your Setup
+
+| Component | Details |
+|---|---|
+| **Cluster type** | kubeadm (self-managed, NOT EKS) |
+| **Master node** | 1 EC2 instance — runs control plane components |
+| **Worker nodes** | 2 EC2 instances — run application pods |
+| **Load balancer** | HAProxy on a dedicated EC2 instance |
+| **API Gateway** | Envoy Gateway (Kubernetes Gateway API) — **NOT NGINX Ingress** |
+| **Container registry** | Docker Hub |
+| **Secret management** | Sealed Secrets |
+| **Observability** | Prometheus + Grafana + Node Exporter + kube-state-metrics |
+
+> [!IMPORTANT]
+> Since you are using a **kubeadm** self-managed cluster, your **Master Node is your workbench**. You SSH into it to run `kubectl`, `helm`, `git`, and `argocd` commands. All commands in this walkthrough are meant to be run from your Master Node unless stated otherwise.
+
+---
+
+## 3. Repository Layout
+
+Your multi-repo organization:
 
 ```
 fitforge101/
@@ -91,9 +137,8 @@ fitforge101/
 ├── fitforge-ai-service            # Microservice repo (Python)
 ├── fitforge-api-gateway           # API Gateway repo
 ├── fitforge-frontend              # Frontend repo
-├── fitforge-shared                # Reusable CI workflows repo
-├── fitforge-helm-charts           # ← GitOps repo (Helm charts + ArgoCD manifests)
-└── fitforge-infrastructure        # (Optional) Terraform/IaC repo
+├── fitforge-shared                # Reusable CI/CD workflows repo
+└── fitforge-helm-charts           # ← GitOps repo (Helm charts + ArgoCD manifests)
 ```
 
 > [!IMPORTANT]
@@ -101,23 +146,101 @@ fitforge101/
 
 ---
 
-## 3. Prerequisites
+## 4. Multi-Environment Strategy (Dev & Prod)
 
-Before starting, make sure you have:
+This is the critical design decision. Instead of manually testing with `kubectl apply` and then switching to ArgoCD, you use ArgoCD for BOTH environments from the start.
 
-| Requirement | Details |
-|---|---|
-| **Kubernetes cluster** | Your existing K8s cluster (EKS/self-managed) |
-| **kubectl** | Configured with cluster access |
-| **Helm 3** | Installed locally |
-| **Docker Hub account** | With access token created |
-| **GitHub Organization** | `fitforge101` with all repos created |
-| **GitHub PAT** | Personal Access Token with `repo` scope (for cross-repo commits) |
-| **Domain/Ingress** | Optional but recommended for ArgoCD dashboard |
+### How It Works
+
+```mermaid
+graph LR
+    subgraph GIT["fitforge-helm-charts (GitHub)"]
+        DEV_BRANCH["develop branch\n• values-dev.yaml per service"]
+        MAIN_BRANCH["main branch\n• values-prod.yaml per service"]
+    end
+
+    subgraph ARGOCD["ArgoCD"]
+        DEV_APP["Dev ArgoCD Apps\n• Auto-sync ON\n• Watches develop branch"]
+        PROD_APP["Prod ArgoCD Apps\n• Auto-sync OFF\n• Watches main branch"]
+    end
+
+    subgraph CLUSTER["kubeadm Cluster (Same Cluster)"]
+        DEV_NS["fitforge-dev namespace\n• Dev pods"]
+        PROD_NS["fitforge-prod namespace\n• Prod pods"]
+    end
+
+    DEV_BRANCH --> DEV_APP --> DEV_NS
+    MAIN_BRANCH --> PROD_APP --> PROD_NS
+```
+
+### The Workflow
+
+| Step | What Happens | Who Does It |
+|---|---|---|
+| 1 | Developer pushes code to service repo's `develop` branch | You |
+| 2 | GitHub Actions CI builds Docker image with `dev-<SHA>` tag | Automated |
+| 3 | GitHub Actions CD updates `develop` branch of Helm repo | Automated |
+| 4 | ArgoCD **auto-syncs** to `fitforge-dev` namespace | Automated |
+| 5 | You test in dev. If it's broken, push a fix. If it works, continue. | You |
+| 6 | You merge `develop` → `main` in the Helm repo (via PR) | You |
+| 7 | ArgoCD detects the change in `main` but does NOT auto-sync | Automated detection |
+| 8 | You click **"Sync"** in ArgoCD UI to deploy to `fitforge-prod` | You (manual approval) |
+
+### Why This Is Better Than Manual `kubectl apply` Testing
+
+1. **Same process for Dev and Prod** — You practice GitOps from day one
+2. **If Master Node dies** — You rebuild it with `kubeadm`, install ArgoCD, point it at Git, and everything recreates itself
+3. **Audit trail** — Every deployment is a Git commit. You can see who deployed what, when
+4. **Rollback** — Just `git revert` a commit and ArgoCD rolls back automatically
+5. **No "it works on my machine"** — ArgoCD deploys from Git, not from your local files
 
 ---
 
-## 4. Part 1 — Install ArgoCD on Kubernetes
+## 5. Prerequisites
+
+Before starting, make sure you have these on your **Master Node**:
+
+| Requirement | How to Check / Install |
+|---|---|
+| **kubectl** | `kubectl version` — Already configured if kubeadm is working |
+| **Helm 3** | `helm version` — Install: see below |
+| **Git** | `git --version` — Usually pre-installed on EC2 Amazon Linux / Ubuntu |
+| **Docker Hub account** | With access token created at hub.docker.com |
+| **GitHub Organization** | `fitforge101` with all repos created |
+| **GitHub PAT** | Fine-grained token with `repo` scope for cross-repo commits |
+
+### Install Helm on Master Node
+
+```bash
+# Download and install Helm 3
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# Verify
+helm version
+```
+
+### Clone Your Helm Charts Repo on Master Node
+
+```bash
+# SSH into your Master Node
+ssh -i your-key.pem ubuntu@<master-node-ip>
+
+# Create a workspace directory
+mkdir -p ~/fitforge && cd ~/fitforge
+
+# Clone the GitOps repo
+git clone https://github.com/fitforge101/fitforge-helm-charts.git
+cd fitforge-helm-charts
+```
+
+> [!TIP]
+> Your Master Node is now your **Development Workbench**. You will edit Helm charts here, validate them locally with `helm lint` and `helm template`, and then `git push` to GitHub. ArgoCD (running inside the cluster) picks up the changes automatically.
+
+---
+
+## 6. Part 1 — Install ArgoCD on Your kubeadm Cluster
+
+All these commands are run on your **Master Node** (where `kubectl` is configured).
 
 ### Step 1: Create the ArgoCD Namespace
 
@@ -127,165 +250,210 @@ kubectl create namespace argocd
 
 ### Step 2: Install ArgoCD
 
-You have two options — **plain manifests** or **Helm chart**. We'll use **plain manifests** for simplicity (the official recommended way):
+We'll use the standard (non-HA) install since you have 2 worker nodes. For a production cluster with more nodes, use HA manifests.
 
 ```bash
-# Install the stable release (non-HA for learning; use HA manifests for production)
+# Install the stable release
 kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
 ```
 
-> [!TIP]
-> For **production HA** setup, use:
-> ```bash
-> kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/ha/install.yaml
-> ```
-> This deploys multiple replicas of the API server, repo server, and controller with leader election.
+> [!NOTE]
+> This downloads the YAML manifests from GitHub and applies them to your cluster. The ArgoCD pods will be scheduled on your **Worker Nodes** (not the Master, since kubeadm taints the Master by default).
 
-### Step 3: Verify Installation
+### Step 3: Wait for All Pods to Be Ready
 
 ```bash
-kubectl get pods -n argocd
+# Watch the pods come up (Ctrl+C to exit)
+kubectl get pods -n argocd -w
 ```
 
-Expected output (all pods should be `Running`):
+Expected output (all pods should reach `Running` — this may take 1-2 minutes):
 
 ```
 NAME                                                READY   STATUS    RESTARTS   AGE
-argocd-application-controller-0                     1/1     Running   0          60s
-argocd-applicationset-controller-xxx                1/1     Running   0          60s
-argocd-dex-server-xxx                               1/1     Running   0          60s
-argocd-notifications-controller-xxx                 1/1     Running   0          60s
-argocd-redis-xxx                                    1/1     Running   0          60s
-argocd-repo-server-xxx                              1/1     Running   0          60s
-argocd-server-xxx                                   1/1     Running   0          60s
+argocd-application-controller-0                     1/1     Running   0          90s
+argocd-applicationset-controller-xxx                1/1     Running   0          90s
+argocd-dex-server-xxx                               1/1     Running   0          90s
+argocd-notifications-controller-xxx                 1/1     Running   0          90s
+argocd-redis-xxx                                    1/1     Running   0          90s
+argocd-repo-server-xxx                              1/1     Running   0          90s
+argocd-server-xxx                                   1/1     Running   0          90s
 ```
 
-### Step 4: Check Services
+### Step 4: Verify Services
 
 ```bash
 kubectl get svc -n argocd
 ```
 
-You'll see `argocd-server` as a `ClusterIP` service by default.
+You'll see `argocd-server` as a `ClusterIP` service by default. We'll expose it in the next part.
 
 ---
 
-## 5. Part 2 — Access the ArgoCD Dashboard
+## 7. Part 2 — Access the ArgoCD Dashboard
 
-### Option A: Port Forward (Quick Access / Development)
+Since you're on EC2 with kubeadm and Envoy Gateway, here are your options:
 
-```bash
-kubectl port-forward svc/argocd-server -n argocd 8080:443
-```
+### Option A: NodePort (Simplest for EC2 — Recommended to Start)
 
-Then open: `https://localhost:8080`
-
-### Option B: NodePort (If No Ingress)
+Expose ArgoCD on a NodePort so you can access it from your browser via the EC2 public IP:
 
 ```bash
+# Change argocd-server service type to NodePort
 kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "NodePort"}}'
+
+# Find the assigned NodePort
+kubectl get svc argocd-server -n argocd
 ```
 
-### Option C: Ingress (Production — Recommended)
+Output will look like:
+```
+NAME            TYPE       CLUSTER-IP      EXTERNAL-IP   PORT(S)                      AGE
+argocd-server   NodePort   10.96.123.456   <none>        80:31234/TCP,443:31567/TCP   5m
+```
 
-If you're using **Envoy Gateway** or **NGINX Ingress Controller**, create an Ingress resource:
+The port `31567` (your number will be different) is the HTTPS NodePort.
+
+**Access it:**
+1. Make sure your **EC2 Security Group** allows inbound traffic on that port (e.g., `31567`)
+2. Open in browser: `https://<master-or-worker-node-public-ip>:31567`
+
+> [!WARNING]
+> You need to add the NodePort to your **EC2 Security Group** inbound rules:
+> - **Type**: Custom TCP
+> - **Port range**: The NodePort number (e.g., `31567`)
+> - **Source**: Your IP or `0.0.0.0/0` (for testing only — restrict in production!)
+
+### Option B: Port Forward via SSH Tunnel (No Security Group Changes)
+
+If you don't want to open extra ports on EC2:
+
+```bash
+# On your Master Node, start port-forward
+kubectl port-forward svc/argocd-server -n argocd 8080:443 --address 0.0.0.0 &
+```
+
+Then create an SSH tunnel from your local PC:
+
+```bash
+# On your local PC (Windows/Mac)
+ssh -i your-key.pem -L 8080:localhost:8080 ubuntu@<master-node-ip>
+```
+
+Open in browser: `https://localhost:8080`
+
+### Option C: Envoy Gateway Route (Production — After Initial Setup)
+
+Once ArgoCD is working, you can expose it properly via your Envoy Gateway. Create an `HTTPRoute`:
 
 ```yaml
-# argocd-ingress.yaml
-apiVersion: networking.k8s.io/v1
-kind: Ingress
+# argocd-httproute.yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
 metadata:
-  name: argocd-server-ingress
+  name: argocd-route
   namespace: argocd
-  annotations:
-    nginx.ingress.kubernetes.io/ssl-passthrough: "true"
-    nginx.ingress.kubernetes.io/backend-protocol: "HTTPS"
 spec:
-  ingressClassName: nginx   # Change to your ingress class
+  parentRefs:
+    - name: eg                           # Your Envoy Gateway name
+      namespace: envoy-gateway-system    # Your Envoy Gateway namespace
+  hostnames:
+    - "argocd.fitforge.dev"              # Your domain (or use nip.io for testing)
   rules:
-    - host: argocd.fitforge.dev   # Your domain
-      http:
-        paths:
-          - path: /
-            pathType: Prefix
-            backend:
-              service:
-                name: argocd-server
-                port:
-                  number: 443
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: argocd-server
+          namespace: argocd
+          port: 443
 ```
 
 ```bash
-kubectl apply -f argocd-ingress.yaml
+kubectl apply -f argocd-httproute.yaml
 ```
+
+> [!NOTE]
+> For Option C to work, you need:
+> 1. Envoy Gateway already installed and a `Gateway` resource created
+> 2. DNS pointing `argocd.fitforge.dev` to your HAProxy → Envoy Gateway
+> 3. TLS configured (either via cert-manager or your HAProxy)
+> 
+> **Start with Option A (NodePort) to get ArgoCD up fast. Move to Option C later.**
 
 ### Get the Initial Admin Password
 
 ```bash
-# The initial password is stored in a Kubernetes secret
-kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+# The initial password is auto-generated and stored in a Kubernetes secret
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
 ```
-
-> [!WARNING]
-> **Change this password immediately** after first login, or better yet, set up OIDC (Part 4) and disable the admin account entirely.
 
 **Login credentials:**
 - **Username**: `admin`
 - **Password**: (output of the command above)
 
+> [!WARNING]
+> **Change this password immediately** after first login! We'll set up GitHub OIDC login in Part 4 and disable this admin account.
+
 ---
 
-## 6. Part 3 — ArgoCD CLI Setup
+## 8. Part 3 — ArgoCD CLI Setup (On Master Node)
+
+Install the ArgoCD CLI on your **Master Node** so you can manage ArgoCD from the terminal.
 
 ### Install the CLI
 
 ```bash
-# Linux
+# Download the latest ArgoCD CLI binary (Linux AMD64 — EC2 is x86_64)
 curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
 chmod +x argocd
 sudo mv argocd /usr/local/bin/
 
-# macOS
-brew install argocd
-
-# Windows (with scoop)
-scoop install argocd
+# Verify installation
+argocd version --client
 ```
 
 ### Login via CLI
 
 ```bash
-# If using port-forward on localhost:8080
-argocd login localhost:8080 --insecure
+# If using NodePort (Option A)
+argocd login <master-node-ip>:<nodeport> --insecure
 
-# If using a domain
-argocd login argocd.fitforge.dev --insecure
+# If using port-forward (Option B)
+argocd login localhost:8080 --insecure
 ```
 
-### Change Admin Password (Do This First!)
+Enter `admin` and the password you retrieved earlier.
+
+### Change Admin Password (Do This Immediately!)
 
 ```bash
 argocd account update-password
 ```
 
-### Add Your Cluster (if managing external clusters)
+### Verify Cluster Connection
+
+Since ArgoCD is running **inside** your kubeadm cluster, it automatically has access to the local cluster:
 
 ```bash
-# List available contexts
-kubectl config get-contexts
+argocd cluster list
+```
 
-# Add a cluster
-argocd cluster add <context-name>
+Expected output:
+```
+SERVER                          NAME        VERSION  STATUS   MESSAGE
+https://kubernetes.default.svc  in-cluster  1.28     Successful
 ```
 
 > [!NOTE]
-> If ArgoCD is deployed **inside** the cluster it manages, it uses the in-cluster service account automatically (`https://kubernetes.default.svc`). You don't need to add it explicitly.
+> You do NOT need to run `argocd cluster add`. When ArgoCD runs inside the cluster it manages, it uses the in-cluster service account automatically (`https://kubernetes.default.svc`).
 
 ---
 
-## 7. Part 4 — OIDC / SSO with GitHub (Dex)
+## 9. Part 4 — OIDC / SSO with GitHub (Dex)
 
-This is where we set up **Login via GitHub** for ArgoCD. GitHub's OAuth is not strictly OIDC-compliant, so ArgoCD uses **Dex** (bundled with ArgoCD) as an identity broker.
+This sets up **"Login via GitHub"** for ArgoCD. GitHub's OAuth is not strictly OIDC-compliant, so ArgoCD uses **Dex** (bundled with ArgoCD) as an identity broker.
 
 ### Step 1: Create a GitHub OAuth App
 
@@ -293,13 +461,23 @@ This is where we set up **Login via GitHub** for ArgoCD. GitHub's OAuth is not s
 2. Navigate to **Developer settings** → **OAuth Apps** → **New OAuth App**
 3. Fill in:
    - **Application name**: `ArgoCD FitForge`
-   - **Homepage URL**: `https://argocd.fitforge.dev` (or your ArgoCD URL)
-   - **Authorization callback URL**: `https://argocd.fitforge.dev/api/dex/callback`
+   - **Homepage URL**: `https://<your-argocd-url>` (e.g., `https://<master-ip>:<nodeport>` for now)
+   - **Authorization callback URL**: `https://<your-argocd-url>/api/dex/callback`
+
+> [!IMPORTANT]
+> The **callback URL must exactly match** the URL you use to access ArgoCD. If you're using NodePort:
+> `https://<master-ip>:31567/api/dex/callback`
+> 
+> When you later move to Envoy Gateway with a domain, you'll update this to:
+> `https://argocd.fitforge.dev/api/dex/callback`
+
 4. Click **Register application**
 5. Note down the **Client ID**
 6. Click **Generate a new client secret** → copy it immediately
 
 ### Step 2: Store the Client Secret in Kubernetes
+
+Run this on your **Master Node**:
 
 ```bash
 # Patch the existing argocd-secret (recommended approach)
@@ -309,10 +487,12 @@ kubectl -n argocd patch secret argocd-secret \
     {
       "op": "add",
       "path": "/data/dex.github.clientSecret",
-      "value": "'$(echo -n "<YOUR_GITHUB_CLIENT_SECRET>" | base64)'"
+      "value": "'$(echo -n "YOUR_GITHUB_CLIENT_SECRET_HERE" | base64)'"
     }
   ]'
 ```
+
+> Replace `YOUR_GITHUB_CLIENT_SECRET_HERE` with your actual secret.
 
 ### Step 3: Configure the `argocd-cm` ConfigMap
 
@@ -323,13 +503,9 @@ kubectl edit configmap argocd-cm -n argocd
 Add the following to the `data` section:
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: argocd-cm
-  namespace: argocd
 data:
-  url: https://argocd.fitforge.dev    # ← Your ArgoCD URL
+  # ← Use your actual ArgoCD URL
+  url: https://<master-ip>:<nodeport>
 
   dex.config: |
     connectors:
@@ -337,10 +513,10 @@ data:
         id: github
         name: GitHub
         config:
-          clientID: <YOUR_GITHUB_CLIENT_ID>
-          clientSecret: $dex.github.clientSecret    # ← References the K8s secret
+          clientID: YOUR_GITHUB_CLIENT_ID
+          clientSecret: $dex.github.clientSecret
           orgs:
-            - name: fitforge101                     # ← Your GitHub org
+            - name: fitforge101
               # Optionally restrict to specific teams:
               # teams:
               #   - devops
@@ -351,37 +527,33 @@ data:
 
 ```bash
 kubectl rollout restart deployment argocd-dex-server -n argocd
+
+# Wait for it to come back up
+kubectl get pods -n argocd -l app.kubernetes.io/name=argocd-dex-server -w
 ```
 
 ### Step 5: Verify
 
-1. Open ArgoCD Dashboard
-2. You should now see a **"Log in via GitHub"** button
-3. Click it → Authorize → You're in!
+1. Open the ArgoCD Dashboard
+2. You should now see a **"Log in via GitHub"** button alongside the admin login
+3. Click it → Authorize the OAuth App → You're in!
 
 ### Step 6: (Optional) Disable the Admin Account
 
-Once OIDC is working, disable the built-in admin for security:
+Once OIDC is confirmed working:
 
 ```bash
-kubectl edit configmap argocd-cm -n argocd
-```
+kubectl patch configmap argocd-cm -n argocd --type merge \
+  -p '{"data": {"admin.enabled": "false"}}'
 
-Add:
-```yaml
-data:
-  admin.enabled: "false"
-```
-
-```bash
 kubectl rollout restart deployment argocd-server -n argocd
 ```
 
 ---
 
-## 8. Part 5 — RBAC (Role-Based Access Control)
+## 10. Part 5 — RBAC (Role-Based Access Control)
 
-Now that users can log in via GitHub, you need to control **who can do what**.
+Now that users can log in via GitHub, control **who can do what**.
 
 ### Configure RBAC via ConfigMap
 
@@ -390,11 +562,6 @@ kubectl edit configmap argocd-rbac-cm -n argocd
 ```
 
 ```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: argocd-rbac-cm
-  namespace: argocd
 data:
   # Default policy for authenticated users (read-only is safest)
   policy.default: role:readonly
@@ -403,7 +570,7 @@ data:
     # Organization admins get full admin access
     g, fitforge101:devops, role:admin
 
-    # Developers can sync but not delete
+    # Developers can sync and view but not delete
     p, role:developer, applications, get, */*, allow
     p, role:developer, applications, sync, */*, allow
     p, role:developer, applications, action/*, */*, allow
@@ -414,16 +581,741 @@ data:
   scopes: '[groups]'
 ```
 
-**Explanation:**
-- `g, fitforge101:devops, role:admin` → Members of the `devops` team in `fitforge101` org get admin
-- `g, fitforge101:developers, role:developer` → Members of `developers` team get the custom developer role
-- `policy.default: role:readonly` → Anyone else who logs in gets read-only access
+**What this means:**
+
+| GitHub Team | ArgoCD Role | Permissions |
+|---|---|---|
+| `fitforge101:devops` | `admin` | Full access — create, sync, delete apps |
+| `fitforge101:developers` | `developer` | Can view and sync apps, view logs. Cannot delete |
+| Everyone else | `readonly` | Can view apps and status only |
 
 ---
 
-## 9. Part 6 — GitHub Actions CD Workflow
+## 11. Part 6 — Helm Charts Repo Structure (Multi-Environment)
 
-This is the **heart of the CD pipeline**. After CI builds and pushes the Docker image, the CD step updates the Helm charts repo with the new image tag.
+This is how your `fitforge-helm-charts` repo should be structured to support **Dev and Prod** environments.
+
+### Directory Structure
+
+```
+fitforge-helm-charts/
+│
+├── charts/                                # All Helm charts
+│   ├── user-service/
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml                    # ← Shared defaults
+│   │   ├── values-dev.yaml                # ← Dev overrides (image tag, replicas, etc.)
+│   │   ├── values-prod.yaml               # ← Prod overrides
+│   │   └── templates/
+│   │       ├── deployment.yaml
+│   │       ├── service.yaml
+│   │       ├── configmap.yaml
+│   │       ├── sealed-secret.yaml
+│   │       ├── hpa.yaml
+│   │       └── _helpers.tpl
+│   │
+│   ├── workout-service/
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml
+│   │   ├── values-dev.yaml
+│   │   ├── values-prod.yaml
+│   │   └── templates/
+│   │       └── ...
+│   │
+│   ├── progress-service/
+│   │   └── ...
+│   ├── nutrition-service/
+│   │   └── ...
+│   ├── ai-service/
+│   │   └── ...
+│   └── api-gateway/
+│       └── ...
+│
+├── argocd/                                # ArgoCD manifests
+│   ├── projects/
+│   │   └── fitforge-project.yaml          # AppProject with dev+prod namespaces
+│   ├── root-app/                          # App of Apps Helm chart
+│   │   ├── Chart.yaml
+│   │   ├── values.yaml
+│   │   └── templates/
+│   │       └── applications.yaml
+│   └── root-app-bootstrap.yaml            # The ONLY file you kubectl apply manually
+│
+└── README.md
+```
+
+### Example `values.yaml` (Shared Defaults)
+
+This file contains settings common to ALL environments:
+
+```yaml
+# charts/ai-service/values.yaml
+
+# ─── Image Configuration ───
+image:
+  repository: aswindevs/fitforge-ai-service
+  tag: latest                     # ← Overridden per environment
+  pullPolicy: IfNotPresent
+
+# ─── Service ───
+service:
+  type: ClusterIP
+  port: 5000
+
+# ─── Probes ───
+livenessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: 5000
+  initialDelaySeconds: 5
+  periodSeconds: 5
+```
+
+### Example `values-dev.yaml` (Dev Overrides)
+
+```yaml
+# charts/ai-service/values-dev.yaml
+# ── Only the values that DIFFER from the base values.yaml ──
+
+image:
+  tag: dev-abc1234               # ← Updated by GitHub Actions CD on develop branch
+
+replicaCount: 1                  # ← Fewer replicas in dev to save resources on EC2
+
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "100m"
+  limits:
+    memory: "256Mi"
+    cpu: "250m"
+
+env:
+  LOG_LEVEL: "debug"
+  USER_SERVICE_URL: "http://user-service.fitforge-dev.svc.cluster.local:3001"
+```
+
+### Example `values-prod.yaml` (Prod Overrides)
+
+```yaml
+# charts/ai-service/values-prod.yaml
+# ── Only the values that DIFFER from the base values.yaml ──
+
+image:
+  tag: v1.0.5                   # ← Updated by GitHub Actions CD on main branch
+
+replicaCount: 2                  # ← More replicas in prod for availability
+
+resources:
+  requests:
+    memory: "256Mi"
+    cpu: "250m"
+  limits:
+    memory: "512Mi"
+    cpu: "500m"
+
+env:
+  LOG_LEVEL: "info"
+  USER_SERVICE_URL: "http://user-service.fitforge-prod.svc.cluster.local:3001"
+```
+
+### Example `deployment.yaml` Template
+
+```yaml
+# charts/ai-service/templates/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "ai-service.fullname" . }}
+  labels:
+    {{- include "ai-service.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "ai-service.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "ai-service.selectorLabels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: {{ .Chart.Name }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          {{- if .Values.env }}
+          env:
+            {{- range $key, $value := .Values.env }}
+            - name: {{ $key }}
+              value: {{ $value | quote }}
+            {{- end }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+```
+
+---
+
+## 12. Part 7 — Validating Helm Charts Before Deploying
+
+> [!IMPORTANT]
+> **Never push a broken Helm chart to Git.** Validate locally on your Master Node first, AND automate validation in GitHub Actions.
+
+### Level 1: Validate on Master Node (Manual — While Writing Charts)
+
+SSH into your Master Node and run these from your cloned `fitforge-helm-charts` repo:
+
+#### a) Lint the Chart (Syntax Check)
+
+```bash
+cd ~/fitforge/fitforge-helm-charts
+
+# Check for common YAML/Helm errors
+helm lint charts/ai-service/
+
+# Lint with environment-specific values
+helm lint charts/ai-service/ -f charts/ai-service/values-dev.yaml
+```
+
+If there are errors, Helm will tell you exactly which file and line has the issue.
+
+#### b) Render Templates (Logic Check — The Secret Weapon)
+
+This renders your Helm templates into raw Kubernetes YAML **without** applying anything. Read the output to verify the image tag, ports, env vars, replicas, etc. are correct:
+
+```bash
+# Render with dev values
+helm template ai-service-dev charts/ai-service/ \
+  -f charts/ai-service/values.yaml \
+  -f charts/ai-service/values-dev.yaml \
+  --namespace fitforge-dev
+
+# Render with prod values
+helm template ai-service-prod charts/ai-service/ \
+  -f charts/ai-service/values.yaml \
+  -f charts/ai-service/values-prod.yaml \
+  --namespace fitforge-prod
+```
+
+> [!TIP]
+> Pipe the output to a file for easier review:
+> ```bash
+> helm template ai-service-dev charts/ai-service/ -f charts/ai-service/values-dev.yaml > /tmp/rendered-dev.yaml
+> cat /tmp/rendered-dev.yaml
+> ```
+
+#### c) Dry-Run Against the Cluster (Kubernetes Validation)
+
+This sends the rendered YAML to your kubeadm API server and asks: *"Would this work?"* — without actually creating anything:
+
+```bash
+helm template ai-service-dev charts/ai-service/ \
+  -f charts/ai-service/values-dev.yaml \
+  --namespace fitforge-dev | kubectl apply --dry-run=server -f -
+```
+
+If the output says `deployment.apps/ai-service configured (server dry run)` — it's valid!
+
+#### d) ArgoCD Diff (After ArgoCD Is Set Up)
+
+Once ArgoCD is running, you can compare your local files against the live cluster:
+
+```bash
+# Shows a diff of what would change if ArgoCD synced these local files
+argocd app diff ai-service-dev --local charts/ai-service/
+```
+
+### Level 2: Automated Validation in GitHub Actions (CI Guardrail)
+
+Add a validation job to your `fitforge-shared` repo that runs **every time someone pushes to the Helm repo**. This catches errors before ArgoCD ever sees them.
+
+Create this workflow in the `fitforge-helm-charts` repo:
+
+```yaml
+# fitforge-helm-charts/.github/workflows/validate-charts.yml
+name: Validate Helm Charts
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: 'latest'
+
+      - name: Lint All Charts
+        run: |
+          echo "🔍 Linting all Helm charts..."
+          for chart in charts/*/; do
+            echo "──── Linting $chart ────"
+            helm lint "$chart" || exit 1
+            
+            # Lint with dev values if they exist
+            if [ -f "${chart}values-dev.yaml" ]; then
+              echo "  └─ with values-dev.yaml"
+              helm lint "$chart" -f "${chart}values-dev.yaml" || exit 1
+            fi
+            
+            # Lint with prod values if they exist
+            if [ -f "${chart}values-prod.yaml" ]; then
+              echo "  └─ with values-prod.yaml"
+              helm lint "$chart" -f "${chart}values-prod.yaml" || exit 1
+            fi
+          done
+          echo "✅ All charts passed linting!"
+
+      - name: Template All Charts (Render Check)
+        run: |
+          echo "📦 Rendering all Helm charts..."
+          for chart in charts/*/; do
+            chart_name=$(basename "$chart")
+            echo "──── Templating $chart_name ────"
+            
+            # Render with dev values
+            if [ -f "${chart}values-dev.yaml" ]; then
+              helm template "${chart_name}-dev" "$chart" \
+                -f "${chart}values-dev.yaml" \
+                --namespace fitforge-dev > /dev/null || exit 1
+              echo "  ✅ Dev rendering OK"
+            fi
+            
+            # Render with prod values
+            if [ -f "${chart}values-prod.yaml" ]; then
+              helm template "${chart_name}-prod" "$chart" \
+                -f "${chart}values-prod.yaml" \
+                --namespace fitforge-prod > /dev/null || exit 1
+              echo "  ✅ Prod rendering OK"
+            fi
+          done
+          echo "✅ All charts rendered successfully!"
+```
+
+> [!TIP]
+> **Best workflow**: Edit charts on Master Node → `helm lint` + `helm template` locally → `git push` → GitHub Actions validates again automatically → ArgoCD syncs only if validation passes.
+
+---
+
+## 13. Part 8 — ArgoCD Application Manifests (Dev & Prod)
+
+An ArgoCD `Application` is a CRD that tells ArgoCD: *"Watch this Git repo/path, deploy it to this namespace, using these values."*
+
+### Step 1: Create the ArgoCD Project
+
+The project defines security boundaries — what repos are allowed and what namespaces can be deployed to:
+
+```yaml
+# argocd/projects/fitforge-project.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: fitforge
+  namespace: argocd
+spec:
+  description: "FitForge Microservices Platform"
+
+  # ─── Which repos ArgoCD can pull from ───
+  sourceRepos:
+    - "https://github.com/fitforge101/fitforge-helm-charts.git"
+
+  # ─── Where ArgoCD can deploy to (both environments!) ───
+  destinations:
+    - namespace: fitforge-dev
+      server: https://kubernetes.default.svc
+    - namespace: fitforge-prod
+      server: https://kubernetes.default.svc
+    - namespace: argocd
+      server: https://kubernetes.default.svc
+
+  # ─── Allowed resource types ───
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+```
+
+Apply it on your Master Node:
+
+```bash
+kubectl apply -f argocd/projects/fitforge-project.yaml
+```
+
+### Step 2: Create Dev Application (Auto-Sync ON)
+
+```yaml
+# argocd/applications/ai-service-dev.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ai-service-dev
+  namespace: argocd
+  labels:
+    environment: dev
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: fitforge
+
+  # ─── Source: Watch the DEVELOP branch ───
+  source:
+    repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
+    targetRevision: develop              # ← Watches the develop branch
+    path: charts/ai-service
+    helm:
+      valueFiles:
+        - values.yaml                    # ← Base values
+        - values-dev.yaml                # ← Dev overrides (image tag, replicas, etc.)
+
+  # ─── Destination: Deploy to DEV namespace ───
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fitforge-dev
+
+  # ─── Sync Policy: FULLY AUTOMATED ───
+  syncPolicy:
+    automated:
+      prune: true                        # Remove resources deleted from Git
+      selfHeal: true                     # Revert any manual kubectl changes
+    syncOptions:
+      - CreateNamespace=true             # Create fitforge-dev if it doesn't exist
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### Step 3: Create Prod Application (Auto-Sync OFF — Manual Approval)
+
+```yaml
+# argocd/applications/ai-service-prod.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: ai-service-prod
+  namespace: argocd
+  labels:
+    environment: prod
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: fitforge
+
+  # ─── Source: Watch the MAIN branch ───
+  source:
+    repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
+    targetRevision: main                 # ← Watches the main branch
+    path: charts/ai-service
+    helm:
+      valueFiles:
+        - values.yaml                    # ← Base values
+        - values-prod.yaml               # ← Prod overrides
+
+  # ─── Destination: Deploy to PROD namespace ───
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: fitforge-prod
+
+  # ─── Sync Policy: MANUAL (No automated sync!) ───
+  syncPolicy:
+    # NOTE: No "automated" block! ArgoCD will detect changes but NOT auto-deploy.
+    # You must click "Sync" in the ArgoCD UI or run: argocd app sync ai-service-prod
+    syncOptions:
+      - CreateNamespace=true
+      - ApplyOutOfSyncOnly=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+```
+
+### Key Difference Between Dev and Prod
+
+| Setting | Dev | Prod |
+|---|---|---|
+| `targetRevision` | `develop` | `main` |
+| `valueFiles` | `values-dev.yaml` | `values-prod.yaml` |
+| `destination.namespace` | `fitforge-dev` | `fitforge-prod` |
+| `syncPolicy.automated` | ✅ Yes (auto-deploy) | ❌ No (manual click required) |
+
+### Step 4: Connect ArgoCD to Your Private Repo
+
+If `fitforge-helm-charts` is private, ArgoCD needs credentials:
+
+```bash
+# Option A: Via ArgoCD CLI (easiest)
+argocd repo add https://github.com/fitforge101/fitforge-helm-charts.git \
+  --username <github-username> \
+  --password <github-pat>
+```
+
+```bash
+# Option B: Via Kubernetes Secret
+kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fitforge-helm-repo
+  namespace: argocd
+  labels:
+    argocd.argoproj.io/secret-type: repository
+type: Opaque
+stringData:
+  type: git
+  url: https://github.com/fitforge101/fitforge-helm-charts.git
+  username: <github-username>
+  password: <github-pat>
+EOF
+```
+
+---
+
+## 14. Part 9 — App of Apps Pattern
+
+Instead of manually `kubectl apply`-ing each Application manifest, create one **Root Application** that manages all the others.
+
+### Step 1: Root App Helm Chart
+
+```yaml
+# argocd/root-app/Chart.yaml
+apiVersion: v2
+name: fitforge-root-app
+description: Root Application that deploys all FitForge microservices (Dev + Prod)
+version: 1.0.0
+```
+
+### Step 2: Root App Values
+
+```yaml
+# argocd/root-app/values.yaml
+repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
+project: fitforge
+destinationServer: https://kubernetes.default.svc
+
+# ─── Dev Apps (auto-sync ON) ───
+devApps:
+  - name: user-service
+    path: charts/user-service
+  - name: workout-service
+    path: charts/workout-service
+  - name: progress-service
+    path: charts/progress-service
+  - name: nutrition-service
+    path: charts/nutrition-service
+  - name: ai-service
+    path: charts/ai-service
+  - name: api-gateway
+    path: charts/api-gateway
+
+# ─── Prod Apps (auto-sync OFF) ───
+prodApps:
+  - name: user-service
+    path: charts/user-service
+  - name: workout-service
+    path: charts/workout-service
+  - name: progress-service
+    path: charts/progress-service
+  - name: nutrition-service
+    path: charts/nutrition-service
+  - name: ai-service
+    path: charts/ai-service
+  - name: api-gateway
+    path: charts/api-gateway
+```
+
+### Step 3: Root App Template
+
+```yaml
+# argocd/root-app/templates/applications.yaml
+
+# ─── DEV APPLICATIONS (auto-sync ON) ───
+{{- range .Values.devApps }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .name }}-dev
+  namespace: argocd
+  labels:
+    environment: dev
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ $.Values.project }}
+  source:
+    repoURL: {{ $.Values.repoURL }}
+    targetRevision: develop
+    path: {{ .path }}
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-dev.yaml
+  destination:
+    server: {{ $.Values.destinationServer }}
+    namespace: fitforge-dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+{{- end }}
+
+# ─── PROD APPLICATIONS (auto-sync OFF — manual approval) ───
+{{- range .Values.prodApps }}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: {{ .name }}-prod
+  namespace: argocd
+  labels:
+    environment: prod
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: {{ $.Values.project }}
+  source:
+    repoURL: {{ $.Values.repoURL }}
+    targetRevision: main
+    path: {{ .path }}
+    helm:
+      valueFiles:
+        - values.yaml
+        - values-prod.yaml
+  destination:
+    server: {{ $.Values.destinationServer }}
+    namespace: fitforge-prod
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+    retry:
+      limit: 3
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+{{- end }}
+```
+
+### Step 4: Bootstrap the Root App (Run This ONCE on Master Node)
+
+```yaml
+# argocd/root-app-bootstrap.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fitforge-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
+    targetRevision: main
+    path: argocd/root-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+```
+
+Apply it on your Master Node:
+
+```bash
+kubectl apply -f argocd/root-app-bootstrap.yaml
+```
+
+### What Happens Next
+
+```mermaid
+graph TD
+    ROOT["fitforge-root\n(App of Apps)"]
+    
+    ROOT --> USD["user-service-dev"]
+    ROOT --> WSD["workout-service-dev"]
+    ROOT --> PSD["progress-service-dev"]
+    ROOT --> NSD["nutrition-service-dev"]
+    ROOT --> ASD["ai-service-dev"]
+    ROOT --> GWD["api-gateway-dev"]
+    
+    ROOT --> USP["user-service-prod"]
+    ROOT --> WSP["workout-service-prod"]
+    ROOT --> PSP["progress-service-prod"]
+    ROOT --> NSP["nutrition-service-prod"]
+    ROOT --> ASP["ai-service-prod"]
+    ROOT --> GWP["api-gateway-prod"]
+    
+    USD --> DEV["fitforge-dev namespace"]
+    WSD --> DEV
+    PSD --> DEV
+    NSD --> DEV
+    ASD --> DEV
+    GWD --> DEV
+    
+    USP --> PROD["fitforge-prod namespace"]
+    WSP --> PROD
+    PSP --> PROD
+    NSP --> PROD
+    ASP --> PROD
+    GWP --> PROD
+```
+
+ArgoCD now manages **12 applications** (6 services × 2 environments) — all from a single `kubectl apply`!
+
+To add a new service in the future, just add an entry to `argocd/root-app/values.yaml` and push. ArgoCD creates the new apps automatically.
+
+---
+
+## 15. Part 10 — GitHub Actions CD Workflow
+
+After CI builds and pushes the Docker image, the CD step updates the Helm charts repo with the new image tag.
 
 ### Step 1: Create a GitHub PAT for Cross-Repo Access
 
@@ -433,9 +1325,9 @@ This is the **heart of the CD pipeline**. After CI builds and pushes the Docker 
    - **Permissions**: Contents (Read and Write)
 3. Copy the token
 
-### Step 2: Add Secrets to Your Service Repos
+### Step 2: Add Secrets at the Org Level
 
-In **each microservice repo** (or at the org level), add these secrets:
+Go to `fitforge101` → **Settings** → **Secrets and variables** → **Actions** → **New organization secret**:
 
 | Secret Name | Value |
 |---|---|
@@ -443,12 +1335,9 @@ In **each microservice repo** (or at the org level), add these secrets:
 | `DOCKERHUB_USERNAME` | Your Docker Hub username |
 | `DOCKERHUB_TOKEN` | Your Docker Hub access token |
 
-> [!TIP]
-> **Set secrets at the organization level** in `fitforge101` → Settings → Secrets → Actions. This way, all repos inherit them automatically and you only manage them in one place.
+This way, all repos in the org inherit these secrets.
 
 ### Step 3: Create the Reusable CD Workflow
-
-Add this to your **`fitforge-shared`** repo as a reusable workflow:
 
 ```yaml
 # fitforge-shared/.github/workflows/_cd-template.yml
@@ -466,7 +1355,7 @@ on:
         required: true
         type: string
       environment:
-        description: "Target environment (develop or main)"
+        description: "Target environment branch (develop or main)"
         required: true
         type: string
       helm-repo:
@@ -474,11 +1363,6 @@ on:
         required: false
         type: string
         default: "fitforge101/fitforge-helm-charts"
-      helm-values-path:
-        description: "Path to values.yaml in the Helm repo"
-        required: false
-        type: string
-        default: ""
     secrets:
       HELM_REPO_PAT:
         description: "PAT with write access to the Helm charts repo"
@@ -488,44 +1372,69 @@ jobs:
   update-helm-chart:
     runs-on: ubuntu-latest
     steps:
-      # ─── Step 1: Checkout the Helm Charts Repo ───
+      # ─── Step 1: Determine which branch and values file to update ───
+      - name: Set Environment Config
+        id: config
+        run: |
+          if [ "${{ inputs.environment }}" == "main" ]; then
+            echo "branch=main" >> $GITHUB_OUTPUT
+            echo "values_file=charts/${{ inputs.service-name }}/values-prod.yaml" >> $GITHUB_OUTPUT
+            echo "env_name=prod" >> $GITHUB_OUTPUT
+          else
+            echo "branch=develop" >> $GITHUB_OUTPUT
+            echo "values_file=charts/${{ inputs.service-name }}/values-dev.yaml" >> $GITHUB_OUTPUT
+            echo "env_name=dev" >> $GITHUB_OUTPUT
+          fi
+
+      # ─── Step 2: Checkout the Helm Charts Repo ───
       - name: Checkout Helm Charts Repo
         uses: actions/checkout@v4
         with:
           repository: ${{ inputs.helm-repo }}
           token: ${{ secrets.HELM_REPO_PAT }}
-          ref: main
+          ref: ${{ steps.config.outputs.branch }}
 
-      # ─── Step 2: Determine values.yaml Path ───
-      - name: Set Values Path
-        id: paths
+      # ─── Step 3: Install yq for safe YAML manipulation ───
+      - name: Install yq
         run: |
-          if [ -n "${{ inputs.helm-values-path }}" ]; then
-            echo "values_file=${{ inputs.helm-values-path }}" >> $GITHUB_OUTPUT
-          else
-            echo "values_file=charts/${{ inputs.service-name }}/values.yaml" >> $GITHUB_OUTPUT
-          fi
-
-      # ─── Step 3: Update Image Tag ───
-      - name: Update Image Tag in values.yaml
-        run: |
-          VALUES_FILE="${{ steps.paths.outputs.values_file }}"
-          
-          echo "📦 Updating $VALUES_FILE"
-          echo "🏷️  New tag: ${{ inputs.image-tag }}"
-          
-          # Use yq to safely update YAML (avoid sed pitfalls)
-          # Install yq
           sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
           sudo chmod +x /usr/local/bin/yq
+
+      # ─── Step 4: Update Image Tag ───
+      - name: Update Image Tag in values file
+        run: |
+          VALUES_FILE="${{ steps.config.outputs.values_file }}"
           
-          # Update the image tag
+          echo "📦 Service:     ${{ inputs.service-name }}"
+          echo "🌍 Environment: ${{ steps.config.outputs.env_name }}"
+          echo "📄 Values file: $VALUES_FILE"
+          echo "🏷️  New tag:     ${{ inputs.image-tag }}"
+          
+          # Update the image tag using yq (safe YAML editing)
           yq eval '.image.tag = "${{ inputs.image-tag }}"' -i "$VALUES_FILE"
           
-          echo "✅ Updated values.yaml:"
+          echo ""
+          echo "✅ Updated $VALUES_FILE:"
           cat "$VALUES_FILE"
 
-      # ─── Step 4: Commit and Push ───
+      # ─── Step 5: Validate the chart before committing ───
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Validate Helm Chart
+        run: |
+          echo "🔍 Validating Helm chart..."
+          helm lint charts/${{ inputs.service-name }}/ \
+            -f charts/${{ inputs.service-name }}/values.yaml \
+            -f ${{ steps.config.outputs.values_file }}
+          
+          helm template ${{ inputs.service-name }} charts/${{ inputs.service-name }}/ \
+            -f charts/${{ inputs.service-name }}/values.yaml \
+            -f ${{ steps.config.outputs.values_file }} > /dev/null
+          
+          echo "✅ Helm chart is valid!"
+
+      # ─── Step 6: Commit and Push ───
       - name: Commit and Push Changes
         run: |
           git config user.name "github-actions[bot]"
@@ -537,20 +1446,21 @@ jobs:
           if git diff --cached --quiet; then
             echo "⏭️  No changes detected. Skipping commit."
           else
-            git commit -m "🚀 deploy(${{ inputs.service-name }}): update image to ${{ inputs.image-tag }}
+            git commit -m "🚀 deploy(${{ inputs.service-name }}): update image to ${{ inputs.image-tag }} [${{ steps.config.outputs.env_name }}]
 
           Triggered by: ${{ github.repository }}@${{ github.sha }}
-          Environment: ${{ inputs.environment }}
+          Environment: ${{ steps.config.outputs.env_name }}
+          Branch: ${{ steps.config.outputs.branch }}
           Workflow: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
             
             git push
-            echo "✅ Helm chart updated and pushed!"
+            echo "✅ Helm chart updated and pushed to ${{ steps.config.outputs.branch }} branch!"
           fi
 ```
 
-### Step 4: Call the CD Workflow from Each Service Repo
+### Step 4: Call CD from Each Service's CI Workflow
 
-Update the CI workflow in each service repo to call the CD template **after** CI succeeds. Here's the updated workflow for the AI service as an example:
+Update each service's workflow. Example for AI service:
 
 ```yaml
 # fitforge-ai-service/.github/workflows/ci-ai-service.yml
@@ -583,8 +1493,8 @@ jobs:
 
   # ─── CD Job (NEW — updates Helm chart with new image tag) ───
   cd:
-    needs: ci        # ← Only runs AFTER CI succeeds
-    if: github.event_name == 'push'    # ← Only on push, NOT on PRs
+    needs: ci
+    if: github.event_name == 'push'       # Only on push, NOT on PRs
     uses: fitforge101/fitforge-shared/.github/workflows/_cd-template.yml@main
     with:
       service-name: ai-service
@@ -594,14 +1504,26 @@ jobs:
       HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
 ```
 
-> [!IMPORTANT]
-> The CD job has two critical guards:
-> - `needs: ci` — It only runs after CI passes (all tests, scans, image push)
-> - `if: github.event_name == 'push'` — It only runs on actual pushes, NOT on pull requests (you don't want PRs auto-deploying!)
+### How the Environment Branching Works
+
+```
+Push to DEVELOP branch of fitforge-ai-service
+  → CI builds image: aswindevs/fitforge-ai-service:dev-abc1234
+  → CD updates DEVELOP branch of fitforge-helm-charts
+    → Updates charts/ai-service/values-dev.yaml → image.tag: dev-abc1234
+  → ArgoCD watches develop branch → auto-syncs to fitforge-dev namespace ✅
+
+Push to MAIN branch of fitforge-ai-service
+  → CI builds image: aswindevs/fitforge-ai-service:v1.0.5
+  → CD updates MAIN branch of fitforge-helm-charts
+    → Updates charts/ai-service/values-prod.yaml → image.tag: v1.0.5
+  → ArgoCD watches main branch → detects change → waits for manual Sync ⏸️
+  → You click "Sync" in ArgoCD UI → deploys to fitforge-prod namespace ✅
+```
 
 ### Step 5: Ensure CI Outputs the Image Tag
 
-Your `_ci-template.yml` needs to **output** the image tag so the CD job can use it. Add this to your CI template:
+Your `_ci-template.yml` needs to **output** the image tag so the CD job can use it:
 
 ```yaml
 # In _ci-template.yml, add outputs to the job
@@ -623,452 +1545,39 @@ jobs:
           fi
 ```
 
----
-
-## 10. Part 7 — Helm Charts Repo Structure
-
-Your `fitforge-helm-charts` repo should be organized like this:
-
-```
-fitforge-helm-charts/
-├── charts/
-│   ├── user-service/
-│   │   ├── Chart.yaml
-│   │   ├── values.yaml          ← ArgoCD watches this
-│   │   └── templates/
-│   │       ├── deployment.yaml
-│   │       ├── service.yaml
-│   │       ├── configmap.yaml
-│   │       ├── hpa.yaml
-│   │       └── _helpers.tpl
-│   │
-│   ├── workout-service/
-│   │   ├── Chart.yaml
-│   │   ├── values.yaml
-│   │   └── templates/
-│   │       └── ...
-│   │
-│   ├── progress-service/
-│   │   └── ...
-│   │
-│   ├── nutrition-service/
-│   │   └── ...
-│   │
-│   ├── ai-service/
-│   │   └── ...
-│   │
-│   └── api-gateway/
-│       └── ...
-│
-├── argocd/                       ← ArgoCD Application manifests
-│   ├── root-app.yaml             ← The "App of Apps" root
-│   ├── projects/
-│   │   └── fitforge-project.yaml
-│   └── applications/             ← Individual Application manifests
-│       ├── user-service.yaml
-│       ├── workout-service.yaml
-│       ├── progress-service.yaml
-│       ├── nutrition-service.yaml
-│       ├── ai-service.yaml
-│       └── api-gateway.yaml
-│
-└── README.md
-```
-
-### Example `values.yaml` for a Service
-
-```yaml
-# charts/ai-service/values.yaml
-
-# ─── Image Configuration ───
-image:
-  repository: aswindevs/fitforge-ai-service    # ← Your Docker Hub image
-  tag: dev-abc1234                              # ← This gets updated by CD pipeline
-  pullPolicy: IfNotPresent
-
-# ─── Deployment ───
-replicaCount: 2
-
-# ─── Service ───
-service:
-  type: ClusterIP
-  port: 5000
-
-# ─── Resources ───
-resources:
-  requests:
-    memory: "256Mi"
-    cpu: "250m"
-  limits:
-    memory: "512Mi"
-    cpu: "500m"
-
-# ─── Environment Variables ───
-env:
-  GOOGLE_API_KEY: ""           # Injected via Sealed Secret
-  JWT_SECRET: ""               # Injected via Sealed Secret
-  USER_SERVICE_URL: "http://user-service:3001"
-
-# ─── Probes ───
-livenessProbe:
-  httpGet:
-    path: /health
-    port: 5000
-  initialDelaySeconds: 30
-  periodSeconds: 10
-
-readinessProbe:
-  httpGet:
-    path: /health
-    port: 5000
-  initialDelaySeconds: 5
-  periodSeconds: 5
-```
-
-### Example `deployment.yaml` Template
-
-```yaml
-# charts/ai-service/templates/deployment.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {{ include "ai-service.fullname" . }}
-  labels:
-    {{- include "ai-service.labels" . | nindent 4 }}
-spec:
-  replicas: {{ .Values.replicaCount }}
-  selector:
-    matchLabels:
-      {{- include "ai-service.selectorLabels" . | nindent 6 }}
-  template:
-    metadata:
-      labels:
-        {{- include "ai-service.selectorLabels" . | nindent 8 }}
-    spec:
-      containers:
-        - name: {{ .Chart.Name }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
-          imagePullPolicy: {{ .Values.image.pullPolicy }}
-          ports:
-            - containerPort: {{ .Values.service.port }}
-          resources:
-            {{- toYaml .Values.resources | nindent 12 }}
-          {{- if .Values.livenessProbe }}
-          livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
-          {{- end }}
-          {{- if .Values.readinessProbe }}
-          readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
-          {{- end }}
-```
+> [!IMPORTANT]
+> The CD job has three critical guards:
+> - `needs: ci` — Only runs after CI passes (tests, scans, image push)
+> - `if: github.event_name == 'push'` — Only on actual pushes, NOT on pull requests
+> - **Helm validation step** — Lints and templates the chart before committing to Git
 
 ---
 
-## 11. Part 8 — ArgoCD Application Manifests
-
-An ArgoCD `Application` is a CRD that tells ArgoCD: *"Watch this Git repo/path, and deploy it to this namespace."*
-
-### Step 1: Create an ArgoCD Project
-
-Projects are security boundaries. Create one for FitForge:
-
-```yaml
-# argocd/projects/fitforge-project.yaml
-apiVersion: argoproj.io/v1alpha1
-kind: AppProject
-metadata:
-  name: fitforge
-  namespace: argocd
-spec:
-  description: "FitForge Microservices Platform"
-
-  # ─── Which repos ArgoCD can pull from ───
-  sourceRepos:
-    - "https://github.com/fitforge101/fitforge-helm-charts.git"
-
-  # ─── Where ArgoCD can deploy to ───
-  destinations:
-    - namespace: fitforge
-      server: https://kubernetes.default.svc
-    - namespace: fitforge-dev
-      server: https://kubernetes.default.svc
-
-  # ─── What resource types ArgoCD can manage ───
-  clusterResourceWhitelist:
-    - group: ""
-      kind: Namespace
-
-  namespaceResourceWhitelist:
-    - group: "*"
-      kind: "*"
-```
-
-```bash
-kubectl apply -f argocd/projects/fitforge-project.yaml
-```
-
-### Step 2: Create Application Manifests
-
-Create one Application manifest per microservice:
-
-```yaml
-# argocd/applications/ai-service.yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: ai-service
-  namespace: argocd
-  # Finalizer ensures child resources are cleaned up on deletion
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  # ─── Project ───
-  project: fitforge
-
-  # ─── Source: Where to pull the Helm chart from ───
-  source:
-    repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
-    targetRevision: main
-    path: charts/ai-service           # ← Path to the service's Helm chart
-    helm:
-      valueFiles:
-        - values.yaml
-
-  # ─── Destination: Where to deploy in the cluster ───
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: fitforge
-
-  # ─── Sync Policy ───
-  syncPolicy:
-    automated:
-      prune: true         # Remove resources no longer in Git
-      selfHeal: true       # Revert manual kubectl changes
-    syncOptions:
-      - CreateNamespace=true
-      - ApplyOutOfSyncOnly=true
-    retry:
-      limit: 3
-      backoff:
-        duration: 5s
-        factor: 2
-        maxDuration: 3m
-```
-
-Apply it:
-
-```bash
-kubectl apply -f argocd/applications/ai-service.yaml
-```
-
-### What Each Field Means
-
-| Field | Purpose |
-|---|---|
-| `project` | Security boundary — links to the AppProject |
-| `source.repoURL` | The Git repo to watch |
-| `source.path` | Path within the repo containing the Helm chart |
-| `source.targetRevision` | Branch/tag to track (usually `main`) |
-| `destination.server` | The K8s API server (in-cluster = `https://kubernetes.default.svc`) |
-| `destination.namespace` | Target namespace for deployment |
-| `syncPolicy.automated.prune` | Delete K8s resources that no longer exist in Git |
-| `syncPolicy.automated.selfHeal` | If someone does a manual `kubectl edit`, ArgoCD reverts it |
-| `syncPolicy.retry` | Auto-retry failed syncs |
-
-### Step 3: Connect ArgoCD to Your Private Repo
-
-If `fitforge-helm-charts` is a private repo, ArgoCD needs credentials:
-
-```bash
-# Option A: Via CLI
-argocd repo add https://github.com/fitforge101/fitforge-helm-charts.git \
-  --username <github-username> \
-  --password <github-pat>
-
-# Option B: Via Kubernetes Secret
-kubectl apply -f - <<EOF
-apiVersion: v1
-kind: Secret
-metadata:
-  name: fitforge-helm-repo
-  namespace: argocd
-  labels:
-    argocd.argoproj.io/secret-type: repository
-type: Opaque
-stringData:
-  type: git
-  url: https://github.com/fitforge101/fitforge-helm-charts.git
-  username: <github-username>
-  password: <github-pat>
-EOF
-```
-
----
-
-## 12. Part 9 — App of Apps Pattern
-
-Instead of manually applying each Application manifest, use the **App of Apps** pattern — one root Application that manages all the others.
-
-### Step 1: Create a Root App Helm Chart
-
-```yaml
-# argocd/root-app/Chart.yaml
-apiVersion: v2
-name: fitforge-root-app
-description: Root Application that deploys all FitForge microservices
-version: 1.0.0
-```
-
-```yaml
-# argocd/root-app/values.yaml
-apps:
-  - name: user-service
-    path: charts/user-service
-    namespace: fitforge
-
-  - name: workout-service
-    path: charts/workout-service
-    namespace: fitforge
-
-  - name: progress-service
-    path: charts/progress-service
-    namespace: fitforge
-
-  - name: nutrition-service
-    path: charts/nutrition-service
-    namespace: fitforge
-
-  - name: ai-service
-    path: charts/ai-service
-    namespace: fitforge
-
-  - name: api-gateway
-    path: charts/api-gateway
-    namespace: fitforge
-
-# Global settings
-repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
-targetRevision: main
-project: fitforge
-destinationServer: https://kubernetes.default.svc
-```
-
-### Step 2: Create the Template
-
-```yaml
-# argocd/root-app/templates/applications.yaml
-{{- range .Values.apps }}
----
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: {{ .name }}
-  namespace: argocd
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
-spec:
-  project: {{ $.Values.project }}
-  source:
-    repoURL: {{ $.Values.repoURL }}
-    targetRevision: {{ $.Values.targetRevision }}
-    path: {{ .path }}
-    helm:
-      valueFiles:
-        - values.yaml
-  destination:
-    server: {{ $.Values.destinationServer }}
-    namespace: {{ .namespace }}
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-    syncOptions:
-      - CreateNamespace=true
-    retry:
-      limit: 3
-      backoff:
-        duration: 5s
-        factor: 2
-        maxDuration: 3m
-{{- end }}
-```
-
-### Step 3: Deploy the Root Application
-
-This is the **ONLY** Application you create manually. Everything else is managed automatically:
-
-```yaml
-# argocd/root-app-bootstrap.yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
-metadata:
-  name: fitforge-root
-  namespace: argocd
-spec:
-  project: default
-  source:
-    repoURL: https://github.com/fitforge101/fitforge-helm-charts.git
-    targetRevision: main
-    path: argocd/root-app
-  destination:
-    server: https://kubernetes.default.svc
-    namespace: argocd
-  syncPolicy:
-    automated:
-      prune: true
-      selfHeal: true
-```
-
-```bash
-kubectl apply -f argocd/root-app-bootstrap.yaml
-```
-
-Now ArgoCD will:
-1. Sync the root app → Render the Helm template → Create 6 child Application CRDs
-2. Each child Application syncs its respective Helm chart → Deploys the microservice
-3. When you add a new service, just add an entry to `values.yaml` — no manual `kubectl apply`!
-
-```mermaid
-graph TD
-    ROOT["fitforge-root<br/>(App of Apps)"]
-    ROOT --> US["user-service"]
-    ROOT --> WS["workout-service"]
-    ROOT --> PS["progress-service"]
-    ROOT --> NS["nutrition-service"]
-    ROOT --> AI["ai-service"]
-    ROOT --> GW["api-gateway"]
-```
-
----
-
-## 13. Part 10 — ArgoCD Image Updater (Alternative)
+## 16. Part 11 — ArgoCD Image Updater (Alternative)
 
 > [!NOTE]
-> This is an **alternative** to the GitHub Actions CD approach (Part 6). With Image Updater, you don't need the CD workflow at all — ArgoCD watches Docker Hub directly and auto-updates. Pick **one approach**, not both.
+> This is an **alternative** to the GitHub Actions CD approach (Part 10). With Image Updater, you don't need the CD workflow — ArgoCD watches Docker Hub directly. **Pick one approach, not both.**
 
-### When to Use Image Updater vs GitHub Actions CD
+### When to Use Which
 
-| Aspect | GitHub Actions CD (Part 6) | ArgoCD Image Updater |
+| Aspect | GitHub Actions CD (Part 10) | ArgoCD Image Updater |
 |---|---|---|
-| **Control** | Full control — you decide exactly when to update | Automatic — polls registry on interval |
+| **Control** | Full control — you decide when to update | Automatic — polls Docker Hub on interval |
 | **Auditability** | Clear commit trail from CI → Helm repo | Commits made by Image Updater bot |
 | **Complexity** | More workflow code | More K8s configuration |
 | **Best for** | Production, regulated environments | Dev/staging, fast iteration |
+| **Recommended** | ✅ Yes — use this | For learning / quick setups |
 
-### Step 1: Install Image Updater
+### Install Image Updater (On Master Node)
 
 ```bash
 kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj-labs/argocd-image-updater/stable/manifests/install.yaml
-```
 
-### Step 2: Verify
-
-```bash
+# Verify
 kubectl get pods -n argocd | grep image-updater
 ```
 
-### Step 3: Configure Docker Hub Registry Access
+### Configure Docker Hub Credentials
 
 ```bash
 kubectl create -n argocd secret docker-registry dockerhub-creds \
@@ -1077,27 +1586,7 @@ kubectl create -n argocd secret docker-registry dockerhub-creds \
   --docker-server=https://index.docker.io/v1/
 ```
 
-Then register it in the Image Updater config:
-
-```bash
-kubectl edit configmap argocd-image-updater-config -n argocd
-```
-
-```yaml
-data:
-  registries.conf: |
-    registries:
-      - name: Docker Hub
-        api_url: https://registry-1.docker.io
-        prefix: docker.io
-        credentials: pullsecret:argocd/dockerhub-creds
-        defaultns: library
-        default: true
-```
-
-### Step 4: Configure Git Write-Back
-
-For the Image Updater to commit changes back to your Helm repo, it needs Git credentials:
+### Configure Git Write-Back
 
 ```bash
 kubectl -n argocd create secret generic git-creds \
@@ -1105,95 +1594,77 @@ kubectl -n argocd create secret generic git-creds \
   --from-literal=password=<github-pat>
 ```
 
-### Step 5: Annotate Your ArgoCD Applications
+### Annotate ArgoCD Applications
+
+Add these annotations to any Application you want Image Updater to manage:
 
 ```yaml
-apiVersion: argoproj.io/v1alpha1
-kind: Application
 metadata:
-  name: ai-service
-  namespace: argocd
   annotations:
-    # ─── Image Updater Annotations ───
     argocd-image-updater.argoproj.io/image-list: app=aswindevs/fitforge-ai-service
     argocd-image-updater.argoproj.io/app.update-strategy: latest
     argocd-image-updater.argoproj.io/app.pull-secret: pullsecret:argocd/dockerhub-creds
     argocd-image-updater.argoproj.io/write-back-method: git:secret:argocd/git-creds
-    argocd-image-updater.argoproj.io/write-back-target: "helmvalues:charts/ai-service/values.yaml"
+    argocd-image-updater.argoproj.io/write-back-target: "helmvalues:charts/ai-service/values-dev.yaml"
     argocd-image-updater.argoproj.io/app.helm.image-name: image.repository
     argocd-image-updater.argoproj.io/app.helm.image-tag: image.tag
-spec:
-  # ... same as before ...
 ```
 
-**Update Strategies:**
+### Update Strategies
 
 | Strategy | Behavior | Use Case |
 |---|---|---|
 | `semver` | Updates to highest semver tag (e.g., `v1.2.3`) | Production with versioned releases |
 | `latest` | Updates to most recently pushed tag | Dev/staging with commit-SHA tags |
-| `digest` | Tracks a fixed tag but updates when digest changes | When using mutable tags like `latest` |
-| `name` | Alphabetical sorting of tag names | Custom tag naming conventions |
+| `digest` | Tracks a fixed tag, updates when digest changes | When using mutable tags |
 
 ---
 
-## 14. Part 11 — Deployment Strategies
+## 17. Part 12 — Deployment Strategies
 
-### Strategy 1: Rolling Update (Default — Recommended to Start)
+### Strategy 1: Rolling Update (Default — Start Here)
 
-This is built into Kubernetes. No extra tooling needed.
+Built into Kubernetes. No extra tooling needed. Already configured in the Helm template above.
 
 ```yaml
-# In your Helm chart's deployment.yaml template
+# In deployment.yaml template
 spec:
   strategy:
     type: RollingUpdate
     rollingUpdate:
-      maxSurge: 1           # 1 extra pod during update
-      maxUnavailable: 0     # Zero downtime
+      maxSurge: 1              # 1 extra pod during update
+      maxUnavailable: 0        # Zero downtime
 ```
 
 **How it works:**
-1. ArgoCD updates the Deployment spec with new image tag
+1. ArgoCD updates the Deployment with the new image tag
 2. Kubernetes creates a new pod with the new image
-3. Once the new pod passes readiness probes, the old pod is terminated
+3. Once the new pod passes readiness probes → old pod is terminated
 4. Repeat until all pods are updated
 
 ### Strategy 2: Blue-Green (Advanced — Requires Argo Rollouts)
 
-For zero-downtime deployments with instant rollback:
-
 ```bash
-# Install Argo Rollouts
+# Install Argo Rollouts on your kubeadm cluster
 kubectl create namespace argo-rollouts
 kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
 ```
 
-Replace `Deployment` with `Rollout` in your Helm template:
+Replace `Deployment` with `Rollout`:
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Rollout
-metadata:
-  name: {{ include "ai-service.fullname" . }}
 spec:
-  replicas: {{ .Values.replicaCount }}
   strategy:
     blueGreen:
       activeService: ai-service-active
       previewService: ai-service-preview
-      autoPromotionEnabled: true      # Auto-promote after checks pass
-      autoPromotionSeconds: 60        # Wait 60s before promoting
-  selector:
-    matchLabels:
-      app: ai-service
-  template:
-    # ... same pod template as before ...
+      autoPromotionEnabled: true
+      autoPromotionSeconds: 60
 ```
 
 ### Strategy 3: Canary (Advanced — Requires Argo Rollouts)
-
-For gradual traffic shifting:
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -1202,204 +1673,267 @@ spec:
   strategy:
     canary:
       steps:
-        - setWeight: 10          # Send 10% traffic to canary
-        - pause: { duration: 5m }  # Wait 5 min, monitor metrics
+        - setWeight: 10
+        - pause: { duration: 5m }
         - setWeight: 30
         - pause: { duration: 5m }
         - setWeight: 60
         - pause: { duration: 5m }
-        - setWeight: 100         # Full rollout
+        - setWeight: 100
 ```
 
 > [!TIP]
-> **Start with Rolling Updates**. Move to Blue-Green or Canary only when you're comfortable with the basics and have proper observability (Prometheus/Grafana) to monitor deployments.
+> **Start with Rolling Updates.** Move to Blue-Green or Canary only when you have observability (Prometheus/Grafana) set up to monitor deployments — which you already do!
 
 ---
 
-## 15. Part 12 — End-to-End Flow Walkthrough
+## 18. Part 13 — End-to-End Flow Walkthrough
 
-Let's walk through a complete deployment from code change to running pods:
+Let's trace a complete deployment from code push to running pods on your EC2 kubeadm cluster.
 
-### 🔄 The Complete Flow
+### 🔄 Dev Deployment (Fully Automated)
 
 ```
-1. Developer pushes code to fitforge-ai-service (develop branch)
+1. You push code to fitforge-ai-service → develop branch
    │
    ▼
-2. GitHub Actions CI Workflow triggers
+2. GitHub Actions CI triggers
    ├── Checkout source code
-   ├── Run SAST (SonarQube)
-   ├── Run Snyk (vulnerability scan)
+   ├── SAST (SonarQube) + Snyk scan
    ├── Install dependencies
    ├── Build application
    ├── Build Docker image: aswindevs/fitforge-ai-service:dev-abc1234
-   ├── Run Trivy scan
+   ├── Trivy scan on Docker image
    ├── Login to Docker Hub
-   └── Push image to Docker Hub
+   └── Push image to Docker Hub ✅
    │
    ▼
-3. GitHub Actions CD Job triggers (needs: ci)
-   ├── Checkout fitforge-helm-charts repo
-   ├── Update charts/ai-service/values.yaml → image.tag: dev-abc1234
-   ├── Commit: "🚀 deploy(ai-service): update image to dev-abc1234"
-   └── Push to fitforge-helm-charts main branch
+3. GitHub Actions CD triggers (needs: ci)
+   ├── Checkout fitforge-helm-charts (develop branch)
+   ├── Update charts/ai-service/values-dev.yaml → image.tag: dev-abc1234
+   ├── Helm lint + template (validate chart)
+   ├── Commit: "🚀 deploy(ai-service): update image to dev-abc1234 [dev]"
+   └── Push to develop branch ✅
    │
    ▼
-4. ArgoCD detects the Git change (polls every 3 minutes by default)
+4. ArgoCD (running on your Worker Nodes) detects change in develop branch
    │
    ▼
-5. ArgoCD compares desired state (Git) vs live state (cluster)
-   ├── Detects image tag changed: dev-old1234 → dev-abc1234
-   └── Status becomes: "OutOfSync"
+5. ArgoCD compares desired state (Git) vs live state (kubeadm cluster)
+   ├── Detects image tag changed in values-dev.yaml
+   └── Status → "OutOfSync"
    │
    ▼
-6. ArgoCD auto-syncs (because syncPolicy.automated is enabled)
-   ├── Runs helm template to generate manifests
-   ├── Applies updated Deployment to cluster
-   └── Status becomes: "Synced" + "Healthy"
+6. ArgoCD auto-syncs (automated sync policy is ON for dev)
+   ├── Renders Helm chart: helm template + values.yaml + values-dev.yaml
+   ├── Applies to fitforge-dev namespace
+   └── Status → "Synced" + "Healthy" ✅
    │
    ▼
-7. Kubernetes performs Rolling Update
-   ├── Creates new pod with image:dev-abc1234
-   ├── Waits for readiness probe to pass
-   ├── Terminates old pod with image:dev-old1234
-   └── All traffic now goes to new version ✅
+7. Kubernetes (on your Worker Nodes) performs Rolling Update
+   ├── Creates new pod with image:dev-abc1234 on Worker 1 or 2
+   ├── Waits for readiness probe (/health) to pass
+   ├── Terminates old pod
+   └── All traffic goes to new version ✅
 ```
 
-### Verify the Deployment
+### 🚀 Prod Deployment (Manual Approval)
+
+```
+1. You're happy with the dev testing
+   │
+   ▼
+2. You merge develop → main in fitforge-ai-service repo
+   │
+   ▼
+3. GitHub Actions CI triggers on main branch
+   ├── Same CI steps...
+   ├── Build Docker image: aswindevs/fitforge-ai-service:v1.0.5
+   └── Push to Docker Hub ✅
+   │
+   ▼
+4. GitHub Actions CD triggers
+   ├── Checkout fitforge-helm-charts (main branch)
+   ├── Update charts/ai-service/values-prod.yaml → image.tag: v1.0.5
+   └── Push to main branch ✅
+   │
+   ▼
+5. ArgoCD detects change in main branch
+   └── Status → "OutOfSync" ⚠️ (but does NOT auto-sync!)
+   │
+   ▼
+6. You see "OutOfSync" in ArgoCD Dashboard
+   ├── Option A: Click "Sync" button in ArgoCD UI
+   └── Option B: Run on Master Node: argocd app sync ai-service-prod
+   │
+   ▼
+7. ArgoCD syncs to fitforge-prod namespace
+   └── Rolling update in production ✅
+```
+
+### Verify the Deployment (Run on Master Node)
 
 ```bash
-# Check ArgoCD sync status
-argocd app get ai-service
+# ─── Check ArgoCD status ───
+argocd app list                                     # All apps + sync status
+argocd app get ai-service-dev                       # Dev app details
+argocd app get ai-service-prod                      # Prod app details
+argocd app history ai-service-dev                   # Deployment history
 
-# Check pod status
-kubectl get pods -n fitforge -l app=ai-service
+# ─── Check pods ───
+kubectl get pods -n fitforge-dev -l app=ai-service  # Dev pods
+kubectl get pods -n fitforge-prod -l app=ai-service # Prod pods
 
-# Check the running image
-kubectl get pods -n fitforge -l app=ai-service -o jsonpath='{.items[*].spec.containers[*].image}'
+# ─── Verify the running image ───
+kubectl get pods -n fitforge-dev -l app=ai-service \
+  -o jsonpath='{.items[*].spec.containers[*].image}'
 
-# View ArgoCD application history
-argocd app history ai-service
+# ─── Check which Worker Node pods are running on ───
+kubectl get pods -n fitforge-dev -o wide
 ```
 
-### Speed Up Sync (Optional)
+### Speed Up ArgoCD Sync (GitHub Webhook)
 
-By default, ArgoCD polls Git every 3 minutes. To make it near-instant, set up a **GitHub Webhook**:
+By default ArgoCD polls Git every **3 minutes**. Set up a webhook for instant sync:
 
-1. In `fitforge-helm-charts` → **Settings** → **Webhooks** → **Add webhook**
-2. **Payload URL**: `https://argocd.fitforge.dev/api/webhook`
+1. Go to `fitforge-helm-charts` → **Settings** → **Webhooks** → **Add webhook**
+2. **Payload URL**: `https://<argocd-url>/api/webhook`
 3. **Content type**: `application/json`
-4. **Secret**: Generate a random secret
-5. **Events**: Just the push event
+4. **Secret**: Generate a random secret string
+5. **Events**: Just the `push` event
 
-Configure ArgoCD to accept webhooks:
+Configure ArgoCD to accept the webhook:
 
 ```bash
-kubectl edit configmap argocd-cm -n argocd
+kubectl patch configmap argocd-cm -n argocd --type merge \
+  -p '{"data": {"webhook.github.secret": "<your-webhook-secret>"}}'
 ```
-
-```yaml
-data:
-  webhook.github.secret: <your-webhook-secret>
-```
-
-Now deployments trigger **within seconds** of the Helm chart commit!
 
 ---
 
-## 16. Troubleshooting
+## 19. Troubleshooting
 
-### Common Issues
+### Common Issues on kubeadm + EC2
 
 | Problem | Cause | Solution |
 |---|---|---|
-| ArgoCD shows "Unknown" status | Health check not configured | Add proper health checks to your Helm chart |
+| ArgoCD pods stuck in `Pending` | Not enough resources on worker nodes | Check `kubectl describe pod <pod> -n argocd` for resource constraints |
+| Can't access ArgoCD UI | EC2 Security Group blocks port | Add NodePort to inbound rules |
+| ArgoCD shows "Unknown" status | No health check configured | Add `livenessProbe` / `readinessProbe` to Helm chart |
 | "ComparisonError" | Invalid Helm chart | Run `helm template` locally to debug |
-| "OutOfSync" but won't sync | Sync policy not set to automated | Add `syncPolicy.automated` or sync manually |
-| Image not pulling | `ImagePullBackOff` | Check Docker Hub credentials, image tag exists |
+| "OutOfSync" but won't sync | Auto-sync not enabled (Prod behavior) | Click "Sync" or run `argocd app sync <name>` |
+| Image not pulling (`ImagePullBackOff`) | Wrong image tag or Docker Hub rate limit | Check `kubectl describe pod <name>` for details |
 | CD job can't push to Helm repo | PAT lacks permissions | Ensure PAT has `Contents: Write` on `fitforge-helm-charts` |
-| Dex callback error | Wrong callback URL | Ensure it's exactly `https://<your-url>/api/dex/callback` |
-| RBAC "permission denied" | Missing policy | Check `argocd-rbac-cm` and team membership |
+| Dex callback error | Wrong callback URL | Must exactly match `https://<url>/api/dex/callback` |
+| RBAC "permission denied" | Missing team membership | Check `argocd-rbac-cm` and GitHub team membership |
+| Pods scheduled on Master Node | Missing taint | Run `kubectl taint nodes <master> node-role.kubernetes.io/control-plane:NoSchedule` |
 
-### Useful Debug Commands
+### Useful Debug Commands (Run on Master Node)
 
 ```bash
 # ─── ArgoCD Status ───
-argocd app list                          # List all apps
-argocd app get <app-name>                # Detailed app status
-argocd app diff <app-name>               # See what's different
+argocd app list                          # List all apps with status
+argocd app get <app-name>                # Detailed app info
+argocd app diff <app-name>               # What would change on sync
 argocd app sync <app-name>               # Force manual sync
 argocd app history <app-name>            # Deployment history
+argocd app rollback <app-name> <id>      # Rollback to a previous version
 
-# ─── Logs ───
-kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller
-kubectl logs -n argocd -l app.kubernetes.io/name=argocd-server
-kubectl logs -n argocd -l app.kubernetes.io/name=argocd-repo-server
-kubectl logs -n argocd -l app.kubernetes.io/name=argocd-image-updater
+# ─── ArgoCD Logs ───
+kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller --tail=50
+kubectl logs -n argocd -l app.kubernetes.io/name=argocd-server --tail=50
+kubectl logs -n argocd -l app.kubernetes.io/name=argocd-repo-server --tail=50
 
-# ─── Kubernetes ───
-kubectl get events -n fitforge --sort-by='.lastTimestamp'
-kubectl describe pod <pod-name> -n fitforge
-kubectl rollout status deployment/<service-name> -n fitforge
-kubectl rollout undo deployment/<service-name> -n fitforge    # Rollback!
+# ─── Kubernetes Events ───
+kubectl get events -n fitforge-dev --sort-by='.lastTimestamp' | tail -20
+kubectl get events -n fitforge-prod --sort-by='.lastTimestamp' | tail -20
+
+# ─── Pod Debugging ───
+kubectl describe pod <pod-name> -n fitforge-dev
+kubectl logs <pod-name> -n fitforge-dev
+kubectl rollout status deployment/<name> -n fitforge-dev
+
+# ─── Rollback (manual) ───
+kubectl rollout undo deployment/<service-name> -n fitforge-prod
 ```
 
 ---
 
-## 17. Best Practices Checklist
+## 20. Best Practices Checklist
 
 ### Security
 - [ ] Set up OIDC/GitHub SSO (Part 4)
 - [ ] Disable the default `admin` account
-- [ ] Use ArgoCD Projects to restrict access per team
+- [ ] Use ArgoCD Projects to restrict access per environment
 - [ ] Use Sealed Secrets for sensitive data (you already do this!)
-- [ ] Use fine-grained PATs (not classic tokens) for cross-repo access
-- [ ] Never store raw credentials in Git
+- [ ] Use fine-grained PATs (not classic tokens)
+- [ ] Ensure Master Node Security Group only allows SSH from your IP
 
 ### GitOps
-- [ ] Separate source code repos from the Helm charts repo ✅
+- [ ] Separate source code repos from Helm charts repo ✅
+- [ ] Use `develop` branch for Dev, `main` branch for Prod
 - [ ] Never use `:latest` tag — always use commit SHA or semver
 - [ ] CD job only runs on `push` events, never on PRs
 - [ ] Use `yq` (not `sed`) for YAML manipulation
-- [ ] Meaningful commit messages in the Helm repo for audit trail
+- [ ] Validate Helm charts in CI before committing
 
 ### ArgoCD Configuration
-- [ ] Enable `selfHeal` to prevent manual cluster drift
+- [ ] Dev apps: auto-sync ON (fast iteration)
+- [ ] Prod apps: auto-sync OFF (manual approval)
+- [ ] Enable `selfHeal` to prevent `kubectl edit` drift
 - [ ] Enable `prune` to clean up removed resources
-- [ ] Configure retry policies for transient failures
-- [ ] Set up GitHub webhooks for instant sync (not 3-min polling)
-- [ ] Use App of Apps pattern for managing multiple services
+- [ ] Set up GitHub webhooks for instant sync
+- [ ] Use App of Apps pattern for managing all services
+
+### Your kubeadm Cluster
+- [ ] Master Node tainted (no application pods on Master)
+- [ ] Worker Nodes have enough resources for ArgoCD + your services
+- [ ] EC2 Security Groups properly configured
+- [ ] Envoy Gateway routing configured for ArgoCD (after initial setup)
+- [ ] HAProxy updated if exposing ArgoCD via domain
 
 ### Monitoring & Observability
-- [ ] Expose ArgoCD Prometheus metrics
+- [ ] Expose ArgoCD Prometheus metrics (your Prometheus can scrape the ArgoCD pods)
 - [ ] Create Grafana dashboard for deployment tracking
 - [ ] Set up alerts for failed syncs
-- [ ] Monitor ArgoCD resource usage
-
-### Production Readiness
-- [ ] Use HA installation for ArgoCD
-- [ ] Configure Pod Disruption Budgets
-- [ ] Set up Velero backups for ArgoCD namespace
-- [ ] Test disaster recovery procedures
-- [ ] Document rollback procedures
+- [ ] Monitor ArgoCD pod resource usage on Worker Nodes
 
 ---
 
-## Quick Reference: File Cheat Sheet
+## Quick Reference: Implementation Order
+
+Follow these steps in order on your **Master Node**:
+
+| Step | Section | What You Do | Where |
+|---|---|---|---|
+| 1 | Part 1 | `kubectl apply` ArgoCD manifests | Master Node |
+| 2 | Part 2 | Expose ArgoCD via NodePort, open Security Group | Master Node + AWS Console |
+| 3 | Part 3 | Install ArgoCD CLI, login, change password | Master Node |
+| 4 | Part 4 | Create GitHub OAuth App, configure Dex | GitHub + Master Node |
+| 5 | Part 5 | Set up RBAC for teams | Master Node |
+| 6 | Part 6 | Structure `fitforge-helm-charts` repo with values-dev/prod | Master Node (git clone + edit) |
+| 7 | Part 7 | Run `helm lint` + `helm template` to validate | Master Node |
+| 8 | Part 8 | Connect ArgoCD to your Git repo | Master Node |
+| 9 | Part 9 | Apply the root-app-bootstrap.yaml (ONCE) | Master Node |
+| 10 | Part 10 | Add `_cd-template.yml` to `fitforge-shared` | Master Node or local PC |
+| 11 | Part 10 | Update each service's CI workflow to call CD | Master Node or local PC |
+| 12 | Part 13 | Push a code change and watch the magic ✨ | Anywhere! |
+
+---
+
+## Quick Reference: File Locations
 
 | What | Where |
 |---|---|
 | CI Workflow Template | `fitforge-shared/.github/workflows/_ci-template.yml` |
 | **CD Workflow Template** | `fitforge-shared/.github/workflows/_cd-template.yml` |
+| **Chart Validation Workflow** | `fitforge-helm-charts/.github/workflows/validate-charts.yml` |
 | Service CI/CD Workflow | `fitforge-<service>/.github/workflows/ci-<service>.yml` |
-| Helm Charts | `fitforge-helm-charts/charts/<service-name>/` |
-| ArgoCD Applications | `fitforge-helm-charts/argocd/applications/` |
+| Helm Charts (all services) | `fitforge-helm-charts/charts/<service-name>/` |
+| Dev Values | `fitforge-helm-charts/charts/<service>/values-dev.yaml` |
+| Prod Values | `fitforge-helm-charts/charts/<service>/values-prod.yaml` |
 | ArgoCD Project | `fitforge-helm-charts/argocd/projects/fitforge-project.yaml` |
 | Root App (App of Apps) | `fitforge-helm-charts/argocd/root-app/` |
-| ArgoCD Config | `kubectl get cm argocd-cm -n argocd` |
-| ArgoCD RBAC | `kubectl get cm argocd-rbac-cm -n argocd` |
-
----
-
-> [!TIP]
-> **Implementation Order**: Install ArgoCD (Part 1-3) → Set up OIDC (Part 4-5) → Create Helm charts repo structure (Part 7) → Create ArgoCD Applications (Part 8-9) → Add CD workflow to your CI pipeline (Part 6) → Verify end-to-end (Part 12)
+| Root App Bootstrap | `fitforge-helm-charts/argocd/root-app-bootstrap.yaml` |
+| ArgoCD Config | `kubectl get cm argocd-cm -n argocd` (on Master Node) |
+| ArgoCD RBAC | `kubectl get cm argocd-rbac-cm -n argocd` (on Master Node) |
