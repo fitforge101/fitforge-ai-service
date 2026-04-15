@@ -5,18 +5,18 @@ on:
     branches: 
       - develop
       - main
-    paths:
-      - "services/ai-agent-service/**"
-      - ".github/workflows/ci-ai-service.yml"
-      - ".github/workflows/_ci-template.yml"
+    # paths:
+    #   - "services/ai-agent-service/**"
+    #   - ".github/workflows/ci-ai-service.yml"
+    #   - ".github/workflows/_ci-template.yml"
   pull_request:
     branches:
       - develop
       - main
-    paths:
-      - "services/ai-agent-service/**"
-      - ".github/workflows/ci-ai-service.yml"
-      - ".github/workflows/_ci-template.yml"
+    # paths:
+    #   - "services/ai-agent-service/**"
+    #   - ".github/workflows/ci-ai-service.yml"
+    #   - ".github/workflows/_ci-template.yml"
 
 # give the workflow permission to write to the repository contents
 permissions:
@@ -24,10 +24,10 @@ permissions:
 
 jobs:
   ci:
-    uses: ./.github/workflows/_ci-template.yml
+    uses: fitforge101/fitforge-shared/.github/workflows/_ci-template.yml@main
     with:
       service-name: ai-service
-      service-path: services/ai-agent-service
+      service-path: .
       runtime: python
       python-version: "3.11"
       environment: ${{ github.ref_name }}
