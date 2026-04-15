@@ -33,5 +33,3 @@ protobuf>=5.29.6                   # explicit pin: fixes uncontrolled recursion 
 # --- Config / validation ---
 python-dotenv==1.0.1
 pydantic>=2.7.4
-
-###
