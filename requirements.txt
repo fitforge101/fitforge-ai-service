@@ -1,0 +1,35 @@
+# ============================================================
+# ai-agent-service — requirements.txt
+# Updated: 2026-04-13
+# Snyk report fixes: 11 vulnerabilities resolved (1 critical, 7 high)
+# ============================================================
+ 
+# --- Web framework ---
+fastapi>=0.115.0                   # was 0.111.0 — ships starlette>=0.41.x
+uvicorn[standard]>=0.29.0
+starlette>=0.49.1                  # explicit pin: fixes ReDoS (CVE starlette) + multipart resource exhaustion
+ 
+# --- HTTP client ---
+httpx>=0.27.0
+ 
+# --- Auth / JWT ---
+# python-jose==3.3.0 is REMOVED — vulnerable (CVE: improper sig verification + JWT bomb)
+# and has no patched release on PyPI (3.4.0 never published).
+# Replaced with PyJWT, the actively maintained standard.
+PyJWT>=2.10.0
+cryptography>=43.0.0               # required for RS256/ES256 algorithms with PyJWT
+ 
+# --- LangChain stack (full 0.3.x upgrade) ---
+# Older 0.2.x pins blocked fixes for langchain-core deserialization + template injection CVEs
+langchain>=0.3.0                   # was >=0.2.6
+langchain-google-genai>=2.0.0,<4.0.0  # was >=1.0.10 — 1.x only compatible with langchain-core 0.2.x
+                                   # <4.0.0 cap: v4 switches to a new google-genai SDK (breaking change)
+langchain-core>=0.3.81             # was >=0.2.33,<0.3.0 — fixes CRITICAL deserialization + HIGH template injection
+langchain-text-splitters>=0.3.9    # explicit pin: fixes XXE injection in HTMLSectionSplitter
+ 
+# --- Serialization ---
+protobuf>=5.29.6                   # explicit pin: fixes uncontrolled recursion in ParseDict()
+ 
+# --- Config / validation ---
+python-dotenv==1.0.1
+pydantic>=2.7.4

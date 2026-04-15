@@ -1,0 +1,44 @@
+name: CI — Ai Agent Service
+
+on:
+  push:
+    branches: 
+      - develop
+      - main
+    paths:
+      - "services/ai-agent-service/**"
+      - ".github/workflows/ci-ai-service.yml"
+      - ".github/workflows/_ci-template.yml"
+  pull_request:
+    branches:
+      - develop
+      - main
+    paths:
+      - "services/ai-agent-service/**"
+      - ".github/workflows/ci-ai-service.yml"
+      - ".github/workflows/_ci-template.yml"
+
+# give the workflow permission to write to the repository contents
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/_ci-template.yml
+    with:
+      service-name: ai-service
+      service-path: services/ai-agent-service
+      runtime: python
+      python-version: "3.11"
+      environment: ${{ github.ref_name }}
+    secrets: inherit
+
+
+
+
+
+
+
+
+
+
