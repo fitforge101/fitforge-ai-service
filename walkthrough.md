@@ -13,22 +13,25 @@
 2. [Your Infrastructure](#2-your-infrastructure)
 3. [Repository Layout](#3-repository-layout)
 4. [Multi-Environment Strategy (Dev & Prod)](#4-multi-environment-strategy-dev--prod)
-5. [Prerequisites](#5-prerequisites)
-6. [Part 1 — Install ArgoCD on Your kubeadm Cluster](#6-part-1--install-argocd-on-your-kubeadm-cluster)
-7. [Part 2 — Access the ArgoCD Dashboard](#7-part-2--access-the-argocd-dashboard)
-8. [Part 3 — ArgoCD CLI Setup (On Master Node)](#8-part-3--argocd-cli-setup-on-master-node)
-9. [Part 4 — OIDC / SSO with GitHub (Dex)](#9-part-4--oidc--sso-with-github-dex)
-10. [Part 5 — RBAC (Role-Based Access Control)](#10-part-5--rbac-role-based-access-control)
-11. [Part 6 — Helm Charts Repo Structure (Multi-Environment)](#11-part-6--helm-charts-repo-structure-multi-environment)
-12. [Part 7 — Validating Helm Charts Before Deploying](#12-part-7--validating-helm-charts-before-deploying)
-13. [Part 8 — ArgoCD Application Manifests (Dev & Prod)](#13-part-8--argocd-application-manifests-dev--prod)
-14. [Part 9 — App of Apps Pattern](#14-part-9--app-of-apps-pattern)
-15. [Part 10 — GitHub Actions CD Workflow](#15-part-10--github-actions-cd-workflow)
-16. [Part 11 — ArgoCD Image Updater (Alternative)](#16-part-11--argocd-image-updater-alternative)
-17. [Part 12 — Deployment Strategies](#17-part-12--deployment-strategies)
-18. [Part 13 — End-to-End Flow Walkthrough](#18-part-13--end-to-end-flow-walkthrough)
-19. [Troubleshooting](#19-troubleshooting)
-20. [Best Practices Checklist](#20-best-practices-checklist)
+5. [Setting Up Namespaces on Your Cluster](#5-setting-up-namespaces-on-your-cluster)
+6. [How Code Flows from Dev to Prod (No Code Changes!)](#6-how-code-flows-from-dev-to-prod-no-code-changes)
+7. [Complete Beginner Step-by-Step Guide](#7-complete-beginner-step-by-step-guide)
+8. [Prerequisites](#8-prerequisites)
+9. [Part 1 — Install ArgoCD on Your kubeadm Cluster](#9-part-1--install-argocd-on-your-kubeadm-cluster)
+10. [Part 2 — Access the ArgoCD Dashboard](#10-part-2--access-the-argocd-dashboard)
+11. [Part 3 — ArgoCD CLI Setup (On Master Node)](#11-part-3--argocd-cli-setup-on-master-node)
+12. [Part 4 — OIDC / SSO with GitHub (Dex)](#12-part-4--oidc--sso-with-github-dex)
+13. [Part 5 — RBAC (Role-Based Access Control)](#13-part-5--rbac-role-based-access-control)
+14. [Part 6 — Helm Charts Repo Structure (Multi-Environment)](#14-part-6--helm-charts-repo-structure-multi-environment)
+15. [Part 7 — Validating Helm Charts Before Deploying](#15-part-7--validating-helm-charts-before-deploying)
+16. [Part 8 — ArgoCD Application Manifests (Dev & Prod)](#16-part-8--argocd-application-manifests-dev--prod)
+17. [Part 9 — App of Apps Pattern](#17-part-9--app-of-apps-pattern)
+18. [Part 10 — GitHub Actions CD Workflow](#18-part-10--github-actions-cd-workflow)
+19. [Part 11 — ArgoCD Image Updater (Alternative)](#19-part-11--argocd-image-updater-alternative)
+20. [Part 12 — Deployment Strategies](#20-part-12--deployment-strategies)
+21. [Part 13 — End-to-End Flow Walkthrough](#21-part-13--end-to-end-flow-walkthrough)
+22. [Troubleshooting](#22-troubleshooting)
+23. [Best Practices Checklist](#23-best-practices-checklist)
 
 ---
 
@@ -196,7 +199,525 @@ graph LR
 
 ---
 
-## 5. Prerequisites
+## 5. Setting Up Namespaces on Your Cluster
+
+This is the very first thing you do on your **Master Node**. You need two separate namespaces — one for dev, one for prod.
+
+### Why Separate Namespaces?
+
+A Kubernetes namespace is like a "folder" inside your cluster. It provides:
+- **Isolation** — Dev pods can't accidentally talk to Prod pods
+- **Resource limits** — Dev gets fewer resources, Prod gets more
+- **Separate secrets** — Each namespace has its own Sealed Secrets
+- **Clear visibility** — `kubectl get pods -n fitforge-dev` vs `kubectl get pods -n fitforge-prod`
+
+```mermaid
+graph TB
+    subgraph CLUSTER["Your kubeadm Cluster"]
+        subgraph NS_ARGOCD["argocd namespace"]
+            ARGO["ArgoCD Controller\nArgoCD Server\nDex Server\nRedis"]
+        end
+        subgraph NS_DEV["fitforge-dev namespace"]
+            DEV_US["user-service (1 replica)"]
+            DEV_WS["workout-service (1 replica)"]
+            DEV_AI["ai-service (1 replica)"]
+            DEV_DB["...other services"]
+        end
+        subgraph NS_PROD["fitforge-prod namespace"]
+            PROD_US["user-service (2 replicas)"]
+            PROD_WS["workout-service (2 replicas)"]
+            PROD_AI["ai-service (2 replicas)"]
+            PROD_DB["...other services"]
+        end
+    end
+```
+
+### Step 1: Create the Namespaces (Run on Master Node)
+
+```bash
+# SSH into your Master Node
+ssh -i your-key.pem ubuntu@<master-node-ip>
+
+# Create the dev namespace
+kubectl create namespace fitforge-dev
+
+# Create the prod namespace
+kubectl create namespace fitforge-prod
+
+# Verify both exist
+kubectl get namespaces
+```
+
+Expected output:
+```
+NAME              STATUS   AGE
+default           Active   30d
+kube-system       Active   30d
+kube-public       Active   30d
+fitforge-dev      Active   5s     ← NEW
+fitforge-prod     Active   3s     ← NEW
+```
+
+> [!NOTE]
+> ArgoCD can also create namespaces automatically when it syncs (via `syncOptions: CreateNamespace=true` in the Application manifest). But creating them manually first gives you more control to set up labels, resource quotas, and other namespace-level resources.
+
+### Step 2: Label the Namespaces
+
+Labels help you organize and filter resources:
+
+```bash
+# Label dev namespace
+kubectl label namespace fitforge-dev \
+  environment=dev \
+  app.kubernetes.io/part-of=fitforge \
+  team=fitforge
+
+# Label prod namespace
+kubectl label namespace fitforge-prod \
+  environment=prod \
+  app.kubernetes.io/part-of=fitforge \
+  team=fitforge
+
+# Verify labels
+kubectl get namespaces --show-labels | grep fitforge
+```
+
+### Step 3: Set Resource Quotas (Protect Your EC2 Instances)
+
+Since you only have 2 Worker Nodes, you need to limit how much each namespace can consume. Without this, the dev environment could eat all your resources and starve production.
+
+```yaml
+# resource-quota-dev.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fitforge-dev-quota
+  namespace: fitforge-dev
+spec:
+  hard:
+    requests.cpu: "2"               # Dev can request up to 2 CPU total
+    requests.memory: "2Gi"          # Dev can request up to 2Gi RAM total
+    limits.cpu: "4"                 # Dev pods can use up to 4 CPU max
+    limits.memory: "4Gi"            # Dev pods can use up to 4Gi RAM max
+    pods: "20"                      # Max 20 pods in dev
+    services: "15"                  # Max 15 services
+```
+
+```yaml
+# resource-quota-prod.yaml
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: fitforge-prod-quota
+  namespace: fitforge-prod
+spec:
+  hard:
+    requests.cpu: "4"               # Prod gets more CPU
+    requests.memory: "4Gi"          # Prod gets more RAM
+    limits.cpu: "8"
+    limits.memory: "8Gi"
+    pods: "40"                      # More pods allowed in prod
+    services: "20"
+```
+
+```bash
+kubectl apply -f resource-quota-dev.yaml
+kubectl apply -f resource-quota-prod.yaml
+
+# Verify
+kubectl describe resourcequota -n fitforge-dev
+kubectl describe resourcequota -n fitforge-prod
+```
+
+> [!TIP]
+> Adjust these numbers based on your EC2 instance types. If your workers are `t3.medium` (2 vCPU, 4 GiB RAM each), you have 4 vCPU and 8 GiB total across both workers. Reserve some for ArgoCD, kube-system, and your observability stack.
+
+### Step 4: Copy Sealed Secrets to Both Namespaces
+
+You already use Sealed Secrets. You need to create Sealed Secrets in **both** namespaces because secrets are namespace-scoped:
+
+```bash
+# ─── For DEV namespace ───
+# Create the raw secret first
+kubectl create secret generic mongodb-credentials \
+  --namespace fitforge-dev \
+  --from-literal=MONGO_URI='mongodb://fitforge-dev-user:devpassword@mongodb:27017/fitforge_dev' \
+  --from-literal=JWT_SECRET='dev-jwt-secret-key' \
+  --dry-run=client -o yaml | kubeseal --format yaml > sealed-secret-dev.yaml
+
+# Apply the sealed secret
+kubectl apply -f sealed-secret-dev.yaml
+
+# ─── For PROD namespace ───
+kubectl create secret generic mongodb-credentials \
+  --namespace fitforge-prod \
+  --from-literal=MONGO_URI='mongodb://fitforge-prod-user:STRONG_PROD_PASSWORD@mongodb:27017/fitforge_prod' \
+  --from-literal=JWT_SECRET='STRONG_PROD_JWT_SECRET' \
+  --dry-run=client -o yaml | kubeseal --format yaml > sealed-secret-prod.yaml
+
+kubectl apply -f sealed-secret-prod.yaml
+```
+
+> [!IMPORTANT]
+> Dev and Prod should use **different** database credentials, different JWT secrets, and different API keys. Never share production secrets with dev!
+
+### Step 5: Verify Everything is Ready
+
+```bash
+# Check namespaces
+kubectl get namespaces | grep fitforge
+
+# Check resource quotas
+kubectl get resourcequota -n fitforge-dev
+kubectl get resourcequota -n fitforge-prod
+
+# Check secrets
+kubectl get secrets -n fitforge-dev
+kubectl get secrets -n fitforge-prod
+
+# Check that nothing is running yet (should be empty)
+kubectl get all -n fitforge-dev
+kubectl get all -n fitforge-prod
+```
+
+Expected: Both namespaces exist, quotas are set, secrets are created, but **no pods are running yet**. ArgoCD will create the pods when you connect it.
+
+### Summary: What Lives Where
+
+| Namespace | Purpose | Who Creates Pods Here |
+|---|---|---|
+| `kube-system` | Kubernetes system components | kubeadm (automatic) |
+| `argocd` | ArgoCD controller, server, dex | You (one-time install, Part 1) |
+| `sealed-secrets` | Sealed Secrets controller | You (already done) |
+| `envoy-gateway-system` | Envoy Gateway | You (already done) |
+| `monitoring` | Prometheus, Grafana, etc. | You (already done) |
+| `fitforge-dev` | **All FitForge microservices (Dev)** | **ArgoCD (automatic)** |
+| `fitforge-prod` | **All FitForge microservices (Prod)** | **ArgoCD (automatic)** |
+
+---
+
+## 6. How Code Flows from Dev to Prod (No Code Changes!)
+
+This is the number one question beginners have: *"Do I need to change the code when going from dev to prod?"*
+
+**The answer is NO.** The same Docker image runs in both environments. The difference is only in the **configuration** (replicas, resource limits, env variables, database URLs).
+
+### The Key Insight: Same Image, Different Config
+
+```mermaid
+flowchart TD
+    CODE["Your Application Code\n(same for dev and prod)"] --> DOCKER["Docker Image\naswindevs/fitforge-ai-service:v1.0.5\n(same image for both!)"]
+    
+    DOCKER --> DEV_CONFIG["values-dev.yaml\n• 1 replica\n• 128Mi memory\n• dev database URL\n• debug logging"]
+    DOCKER --> PROD_CONFIG["values-prod.yaml\n• 2 replicas\n• 512Mi memory\n• prod database URL\n• info logging"]
+    
+    DEV_CONFIG --> DEV_POD["Pod in fitforge-dev"]
+    PROD_CONFIG --> PROD_POD["Pod in fitforge-prod"]
+```
+
+### How the Git Branches Work
+
+You have **two types of repos** with **different branching strategies**:
+
+#### A) Service Repos (e.g., `fitforge-ai-service`)
+
+These contain your application source code:
+
+| Branch | Purpose | What Triggers |
+|---|---|---|
+| `develop` | Active development | CI builds `dev-<SHA>` Docker image → CD updates Helm repo `develop` branch |
+| `main` | Production-ready code | CI builds `v1.0.X` Docker image → CD updates Helm repo `main` branch |
+
+**You do NOT change any code when promoting.** You just merge `develop` → `main` via a Pull Request. The GitHub Actions workflow uses **conditions** to handle everything automatically:
+
+```yaml
+# This is already in your CI workflow — NO changes needed per environment!
+image-tag: ${{ github.ref_name == 'main' && needs.ci.outputs.version || format('dev-{0}', github.sha) }}
+```
+
+**What this condition does:**
+- If the push is to `main` → use semver tag (e.g., `v1.0.5`)
+- If the push is to `develop` → use dev tag (e.g., `dev-abc1234`)
+
+#### B) Helm Charts Repo (`fitforge-helm-charts`)
+
+This contains your Kubernetes configurations:
+
+| Branch | Purpose | Who Updates It | ArgoCD Watches |
+|---|---|---|---|
+| `develop` | Dev environment configs | GitHub Actions CD (automatic) | `*-dev` ArgoCD apps → `fitforge-dev` namespace |
+| `main` | Prod environment configs | GitHub Actions CD (automatic) | `*-prod` ArgoCD apps → `fitforge-prod` namespace |
+
+### Step-by-Step: Promoting from Dev to Prod
+
+Here's exactly what you do when a feature is tested and ready for production:
+
+#### Step 1: Test in Dev (Automatic)
+
+You've been pushing to `develop` branch of your service repo. GitHub Actions automatically:
+1. Built the Docker image (`dev-abc1234`)
+2. Updated `values-dev.yaml` in the Helm repo's `develop` branch
+3. ArgoCD auto-synced to `fitforge-dev`
+
+You tested it and it works! ✅
+
+#### Step 2: Merge Service Code (You Do This)
+
+```bash
+# In the service repo (e.g., fitforge-ai-service)
+# Option A: Via GitHub UI (RECOMMENDED)
+# Go to GitHub → fitforge-ai-service → Pull Requests → New Pull Request
+# Base: main ← Compare: develop
+# Review the changes → Merge
+
+# Option B: Via command line
+git checkout main
+git merge develop
+git push origin main
+```
+
+This triggers GitHub Actions CI on the `main` branch, which:
+- Builds a **new Docker image** with a semver tag: `v1.0.5`
+- The CD workflow updates `values-prod.yaml` in the Helm repo's `main` branch
+
+#### Step 3: ArgoCD Detects the Change (Automatic)
+
+ArgoCD sees the `main` branch of `fitforge-helm-charts` changed. The prod app shows **"OutOfSync"** in the dashboard.
+
+#### Step 4: Deploy to Prod (You Do This — Manual Approval)
+
+```bash
+# Option A: ArgoCD UI
+# Open ArgoCD Dashboard → Click on "ai-service-prod" → Click "Sync" → Click "Synchronize"
+
+# Option B: ArgoCD CLI (from Master Node)
+argocd app sync ai-service-prod
+```
+
+That's it! The same Docker image now runs in production with production-level configuration.
+
+### What You DON'T Need to Do
+
+| Common Misconception | Reality |
+|---|---|
+| ❌ "I need to change `values.yaml` manually for prod" | ✅ The CD workflow does it automatically based on the branch |
+| ❌ "I need to rebuild the Docker image for prod" | ✅ A new build happens automatically when you merge to `main` |
+| ❌ "I need to change environment variables in code" | ✅ Env vars are in `values-dev.yaml` / `values-prod.yaml`, injected at deploy time |
+| ❌ "I need to SSH into the Master Node to deploy" | ✅ Just click "Sync" in ArgoCD UI or merge a PR |
+| ❌ "I need different Dockerfiles for dev and prod" | ✅ Same Dockerfile, same image. Config differs via Helm values |
+| ❌ "I need to change the CI workflow for prod" | ✅ The workflow uses conditional logic (`github.ref_name == 'main'`) automatically |
+
+### How the CD Workflow Handles Both Environments (The Condition Logic)
+
+Your `_cd-template.yml` reusable workflow has built-in logic to route to the right branch and file:
+
+```yaml
+# This runs INSIDE the CD workflow automatically:
+if [ "${{ inputs.environment }}" == "main" ]; then
+  branch=main                                           # Push to main branch of Helm repo
+  values_file=charts/ai-service/values-prod.yaml        # Update prod values
+else
+  branch=develop                                        # Push to develop branch of Helm repo  
+  values_file=charts/ai-service/values-dev.yaml         # Update dev values
+fi
+```
+
+The `environment` input comes from `github.ref_name` in your service's CI workflow:
+- Push to `develop` branch → `environment: develop` → CD updates `values-dev.yaml` on `develop` branch
+- Push to `main` branch → `environment: main` → CD updates `values-prod.yaml` on `main` branch
+
+**Zero manual intervention. Zero code changes. Just merge and sync.**
+
+---
+
+## 7. Complete Beginner Step-by-Step Guide
+
+If you're feeling overwhelmed, follow this exact order. Each step builds on the previous one.
+
+### Phase 1: Prepare Your Cluster (15 minutes)
+
+> **Where:** SSH into your Master Node
+
+```bash
+# 1. Create namespaces
+kubectl create namespace fitforge-dev
+kubectl create namespace fitforge-prod
+kubectl create namespace argocd
+
+# 2. Label namespaces
+kubectl label namespace fitforge-dev environment=dev
+kubectl label namespace fitforge-prod environment=prod
+
+# 3. Install Helm (if not installed)
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+helm version
+```
+
+### Phase 2: Install ArgoCD (10 minutes)
+
+> **Where:** SSH into your Master Node
+
+```bash
+# 4. Install ArgoCD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# 5. Wait for pods to be ready
+kubectl get pods -n argocd -w    # Wait until all show Running. Press Ctrl+C
+
+# 6. Expose ArgoCD UI via NodePort
+kubectl patch svc argocd-server -n argocd -p '{"spec": {"type": "NodePort"}}'
+kubectl get svc argocd-server -n argocd   # Note the port number (e.g., 31567)
+
+# 7. Get the admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d && echo
+
+# 8. Open Security Group in AWS Console
+#    → EC2 → Security Groups → Add Inbound Rule → Custom TCP → Port 31567 → Your IP
+
+# 9. Open browser: https://<worker-node-public-ip>:31567
+#    Login: admin / <password from step 7>
+```
+
+### Phase 3: Install ArgoCD CLI & Set Up Repo (10 minutes)
+
+> **Where:** SSH into your Master Node
+
+```bash
+# 10. Install ArgoCD CLI
+curl -sSL -o argocd https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+chmod +x argocd
+sudo mv argocd /usr/local/bin/
+
+# 11. Login via CLI
+argocd login <master-ip>:<nodeport> --insecure
+
+# 12. Change password
+argocd account update-password
+
+# 13. Clone your Helm charts repo
+mkdir -p ~/fitforge && cd ~/fitforge
+git clone https://github.com/fitforge101/fitforge-helm-charts.git
+cd fitforge-helm-charts
+
+# 14. Create the develop branch
+git checkout -b develop
+git push origin develop
+git checkout main
+```
+
+### Phase 4: Structure Your Helm Charts Repo (30 minutes)
+
+> **Where:** On your Master Node, inside `~/fitforge/fitforge-helm-charts`
+
+```bash
+# 15. Create the directory structure
+mkdir -p charts/{user-service,workout-service,progress-service,nutrition-service,ai-service,api-gateway}/templates
+mkdir -p argocd/{projects,root-app/templates}
+
+# 16. For each service, create these files:
+#     - charts/<service>/Chart.yaml
+#     - charts/<service>/values.yaml       (shared defaults)
+#     - charts/<service>/values-dev.yaml   (dev overrides)
+#     - charts/<service>/values-prod.yaml  (prod overrides)
+#     - charts/<service>/templates/deployment.yaml
+#     - charts/<service>/templates/service.yaml
+#     - charts/<service>/templates/_helpers.tpl
+#
+# See Part 6 of this walkthrough for the exact file contents.
+
+# 17. Validate your charts
+helm lint charts/ai-service/
+helm lint charts/ai-service/ -f charts/ai-service/values-dev.yaml
+helm template ai-test charts/ai-service/ -f charts/ai-service/values-dev.yaml
+
+# 18. Commit and push to BOTH branches
+git add .
+git commit -m "feat: add Helm charts for all services"
+git push origin main
+
+# Also push to develop branch
+git checkout develop
+git merge main
+git push origin develop
+git checkout main
+```
+
+### Phase 5: Set Up ArgoCD Applications (15 minutes)
+
+> **Where:** On your Master Node
+
+```bash
+# 19. Connect ArgoCD to your private repo
+argocd repo add https://github.com/fitforge101/fitforge-helm-charts.git \
+  --username <your-github-username> \
+  --password <your-github-pat>
+
+# 20. Create the ArgoCD project
+kubectl apply -f argocd/projects/fitforge-project.yaml
+
+# 21. Apply the Root App (this creates ALL 12 ArgoCD applications)
+kubectl apply -f argocd/root-app-bootstrap.yaml
+
+# 22. Watch ArgoCD create and sync all apps
+argocd app list
+
+# 23. Check your dev namespace — pods should be starting!
+kubectl get pods -n fitforge-dev -w
+```
+
+### Phase 6: Set Up the CD Pipeline (20 minutes)
+
+> **Where:** On GitHub (browser) or Master Node
+
+```bash
+# 24. Create a GitHub Fine-Grained PAT:
+#     GitHub → Settings → Developer Settings → Fine-grained tokens
+#     Repository access: fitforge-helm-charts only
+#     Permissions: Contents (Read and Write)
+
+# 25. Add secrets at the org level:
+#     GitHub → fitforge101 → Settings → Secrets → Actions
+#     Add: HELM_REPO_PAT = <your PAT>
+
+# 26. Create the _cd-template.yml in fitforge-shared repo
+#     (See Part 10 of this walkthrough for the exact file)
+
+# 27. Update each service's CI workflow to add the CD job
+#     (See Part 10 for the exact workflow file)
+```
+
+### Phase 7: Test the Full Flow! (5 minutes)
+
+> **Where:** Anywhere (your local PC, Master Node, etc.)
+
+```bash
+# 28. Make a small code change in fitforge-ai-service
+git checkout develop
+echo "# test deployment" >> README.md
+git add . && git commit -m "test: trigger CD pipeline"
+git push origin develop
+
+# 29. Watch GitHub Actions:
+#     Go to GitHub → fitforge-ai-service → Actions
+#     CI job runs → CD job runs → Helm chart updated
+
+# 30. Watch ArgoCD (on Master Node or ArgoCD UI):
+argocd app get ai-service-dev
+kubectl get pods -n fitforge-dev -w
+
+# 31. Once dev is working, promote to prod:
+#     GitHub → fitforge-ai-service → Pull Requests
+#     New PR: base=main ← compare=develop → Merge
+#     ArgoCD shows ai-service-prod as "OutOfSync"
+#     Click "Sync" in ArgoCD UI → Production deployed! 🎉
+```
+
+> [!TIP]
+> **That's it!** You've gone from zero to a complete GitOps CD pipeline. Every future deployment is just: push code → merge → sync.
+
+---
+
+## 8. Prerequisites
 
 Before starting, make sure you have these on your **Master Node**:
 
@@ -1740,35 +2261,78 @@ Let's trace a complete deployment from code push to running pods on your EC2 kub
 ### 🚀 Prod Deployment (Manual Approval)
 
 ```
-1. You're happy with the dev testing
+1. You're happy with dev testing. Time to promote to production!
    │
    ▼
-2. You merge develop → main in fitforge-ai-service repo
+2. You create a Pull Request: develop → main in fitforge-ai-service
+   ├── Go to GitHub → fitforge-ai-service → Pull Requests → New
+   ├── Base: main ← Compare: develop
+   ├── Title: "Release: AI Service v1.0.5"
+   └── Click "Create Pull Request"
    │
    ▼
-3. GitHub Actions CI triggers on main branch
-   ├── Same CI steps...
+3. Review the PR (you or your team)
+   ├── Check the code changes
+   ├── All CI checks pass on the PR (tests, linting)
+   └── Click "Merge Pull Request" → "Confirm Merge"
+   │
+   ▼
+4. The merge triggers GitHub Actions CI on the MAIN branch
+   ├── Same CI steps (SAST, Snyk, build, etc.)
+   ├── But this time it builds with a SEMVER tag!
    ├── Build Docker image: aswindevs/fitforge-ai-service:v1.0.5
    └── Push to Docker Hub ✅
    │
    ▼
-4. GitHub Actions CD triggers
-   ├── Checkout fitforge-helm-charts (main branch)
+5. GitHub Actions CD triggers (environment=main)
+   ├── Checkout fitforge-helm-charts (MAIN branch)
+   ├── The condition routes to: values-prod.yaml (not values-dev.yaml!)
    ├── Update charts/ai-service/values-prod.yaml → image.tag: v1.0.5
-   └── Push to main branch ✅
+   ├── Helm lint + template (validate chart)
+   └── Commit + Push to main branch ✅
    │
    ▼
-5. ArgoCD detects change in main branch
-   └── Status → "OutOfSync" ⚠️ (but does NOT auto-sync!)
+6. ArgoCD detects change in main branch of fitforge-helm-charts
+   └── Status → "OutOfSync" ⚠️ (but does NOT auto-sync! This is intentional.)
    │
    ▼
-6. You see "OutOfSync" in ArgoCD Dashboard
-   ├── Option A: Click "Sync" button in ArgoCD UI
+7. You see "OutOfSync" in ArgoCD Dashboard (yellow icon)
+   ├── You can review what changed: argocd app diff ai-service-prod
+   ├── 
+   ├── Option A: Click "Sync" button in ArgoCD UI → "Synchronize"
    └── Option B: Run on Master Node: argocd app sync ai-service-prod
    │
    ▼
-7. ArgoCD syncs to fitforge-prod namespace
-   └── Rolling update in production ✅
+8. ArgoCD syncs to fitforge-prod namespace
+   ├── Kubernetes performs a Rolling Update
+   ├── New pod with v1.0.5 starts, passes health checks
+   ├── Old pod terminates
+   └── Production is live with v1.0.5! ✅
+```
+
+### 🔄 Hotfix Flow (Emergency Production Fix)
+
+If you need to fix something in production urgently:
+
+```
+1. Create a hotfix branch from main in the service repo
+   git checkout main
+   git checkout -b hotfix/fix-critical-bug
+   
+2. Make the fix, commit, push
+   git add . && git commit -m "fix: critical auth bug"
+   git push origin hotfix/fix-critical-bug
+   
+3. Create PR: hotfix/fix-critical-bug → main (skip develop for urgency)
+   Merge the PR
+   
+4. CI builds v1.0.6 → CD updates values-prod.yaml → ArgoCD shows OutOfSync
+   Click Sync → Production fixed! ✅
+   
+5. Don't forget: merge main back into develop so dev gets the fix too
+   git checkout develop
+   git merge main
+   git push origin develop
 ```
 
 ### Verify the Deployment (Run on Master Node)
