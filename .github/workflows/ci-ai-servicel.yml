@@ -1,0 +1,95 @@
+name: CI/CD — AI Service
+
+on:
+  push:
+    branches:
+      - develop
+      - main
+  pull_request:
+    branches:
+      - develop
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  sast:
+    if: github.event_name == 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/_sast.yml@feature/templates
+    with:
+      service-path: .
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_URL: ${{ secrets.SONAR_URL }}
+
+  # ─── SCA (Snyk) ───
+  sca:
+    needs: [sast]
+    if: github.event_name == 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/_sca.yml@feature/templates
+    with:
+      service-name: ai-service
+      service-path: .
+      runtime: python
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # ─── Notify: Snyk Criticals ───
+  notify-snyk:
+    needs: [sca]
+    if: needs.sca.outputs.critical-found == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@feature/templates
+    with:
+      subject: "🚨 Snyk: Critical Vulnerabilities in ai-service"
+      body: "Critical/High vulnerabilities found in ai-service dependencies."
+      service-name: ai-service
+      artifact-name: snyk-report-ai-service
+    secrets:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  # ─── Temp Docker Build + Trivy Scan ───
+  build:
+    needs: [sast, sca]
+    if: github.event_name == 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@feature/templates
+    with:
+      service-name: ai-service
+      service-path: .
+
+  # ─── Notify: Trivy Criticals ───
+  notify-trivy:
+    needs: [build]
+    if: needs.build.outputs.trivy-critical == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@feature/templates
+    with:
+      subject: "🚨 Trivy: Critical Vulnerabilities in ai-service"
+      body: "CRITICAL vulnerabilities found in ai-service Docker image."
+      service-name: ai-service
+      artifact-name: trivy-ai-service
+    secrets:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  # ─── Publish Docker Image (Tag + Build + Push) ───
+  publish:
+    if: github.event_name == 'push'
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-publish.yml@feature/templates
+    with:
+      service-name: ai-service
+      service-path: .
+      environment: ${{ github.ref_name }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  # ─── Update Helm Chart (CD) ───
+  # cd:
+  #   needs: [publish]
+  #   if: needs.publish.result == 'success'
+  #   uses: fitforge101/fitforge-shared/.github/workflows/_cd-update.yml@main
+  #   with:
+  #     service-name: ai-service
+  #     image-tag: ${{ needs.publish.outputs.image-tag }}
+  #     environment: ${{ github.ref_name }}
+  #   secrets:
+  #     HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
