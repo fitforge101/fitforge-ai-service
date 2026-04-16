@@ -17,7 +17,7 @@ on:
 jobs:
   code-quality:
     if: github.event_name == 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-sast-sca.yml
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-sast-sca.yml@feature/ci-template-split
     with:
       service-name: ai-service
       service-path: .
@@ -31,7 +31,7 @@ jobs:
   build-image:
     needs: [code-quality]
     if: always() && needs.code-quality.result != 'failure' && needs.code-quality.result != 'cancelled'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-build-image.yml
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-build-image.yml@feature/ci-template-split
     with:
       service-name: ai-service
       service-path: .
@@ -43,7 +43,7 @@ jobs:
   trivy-scan:
     needs: [build-image]
     if: needs.build-image.outputs.already_exists != 'true'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-trivy-scan.yml
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-trivy-scan.yml@feature/ci-template-split
     with:
       service-name: ai-service
       image_tag: ${{ needs.build-image.outputs.image_tag }}
@@ -59,7 +59,7 @@ jobs:
       needs.trivy-scan.outputs.critical_found != 'true' &&
       needs.trivy-scan.result == 'success' &&
       github.event_name != 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-push-image.yml
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-push-image.yml@feature/ci-template-split
     with:
       service-name: ai-service
       image_tag: ${{ needs.build-image.outputs.image_tag }}
@@ -71,7 +71,7 @@ jobs:
   tag-release:
     needs: [build-image, push-image]
     if: github.ref_name == 'main' && needs.push-image.result == 'success'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-tag-release.yml
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-tag-release.yml@feature/ci-template-split
     with:
       service-name: ai-service
       service-path: .
