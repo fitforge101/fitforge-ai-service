@@ -16,7 +16,7 @@ permissions:
 jobs:
   sast:
     if: github.event_name == 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/_sast.yml@feature/templates
+    uses: fitforge101/fitforge-shared/.github/workflows/_sast.yml@v2.0.0 
     with:
       service-path: .
     secrets:
@@ -27,7 +27,7 @@ jobs:
   sca:
     needs: [sast]
     if: github.event_name == 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/_sca.yml@feature/templates
+    uses: fitforge101/fitforge-shared/.github/workflows/_sca.yml@v2.0.0
     with:
       service-name: ai-service
       service-path: .
@@ -39,7 +39,7 @@ jobs:
   notify-snyk:
     needs: [sca]
     if: needs.sca.outputs.critical-found == 'true'
-    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@feature/templates
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@v2.0.0
     with:
       subject: "🚨 Snyk: Critical Vulnerabilities in ai-service"
       body: "Critical/High vulnerabilities found in ai-service dependencies."
@@ -52,7 +52,7 @@ jobs:
   build:
     needs: [sast, sca]
     if: github.event_name == 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@feature/templates
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@v2.0.0
     with:
       service-name: ai-service
       service-path: .
@@ -61,7 +61,7 @@ jobs:
   notify-trivy:
     needs: [build]
     if: needs.build.outputs.trivy-critical == 'true'
-    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@feature/templates
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@v2.0.0
     with:
       subject: "🚨 Trivy: Critical Vulnerabilities in ai-service"
       body: "CRITICAL vulnerabilities found in ai-service Docker image."
@@ -73,7 +73,7 @@ jobs:
   # ─── Publish Docker Image (Tag + Build + Push) ───
   publish:
     if: github.event_name == 'push'
-    uses: fitforge101/fitforge-shared/.github/workflows/_docker-publish.yml@feature/templates
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-publish.yml@v2.0.0
     with:
       service-name: ai-service
       service-path: .
@@ -93,3 +93,4 @@ jobs:
   #     environment: ${{ github.ref_name }}
   #   secrets:
   #     HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
+  ########
