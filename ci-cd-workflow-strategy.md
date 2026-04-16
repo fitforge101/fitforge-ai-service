@@ -10,16 +10,17 @@
 1. [What's Wrong with the Current Template](#1-whats-wrong-with-the-current-template)
 2. [The New Architecture](#2-the-new-architecture)
 3. [Workflow Design Principles](#3-workflow-design-principles)
-4. [The Composition Pattern](#4-the-composition-pattern)
+4. [The Composition Pattern — PR vs Push](#4-the-composition-pattern--pr-vs-push)
 5. [Template 1 — `_sast.yml` (SonarQube)](#5-template-1--_sastyml-sonarqube)
 6. [Template 2 — `_sca.yml` (Snyk)](#6-template-2--_scayml-snyk)
-7. [Template 3 — `_docker-build.yml` (Build + Trivy + Push)](#7-template-3--_docker-buildyml-build--trivy--push)
-8. [Template 4 — `_cd-update.yml` (Update Helm Chart)](#8-template-4--_cd-updateyml-update-helm-chart)
-9. [Template 5 — `_notify.yml` (Email Alerts)](#9-template-5--_notifyyml-email-alerts)
-10. [How Service Repos Compose These Templates](#10-how-service-repos-compose-these-templates)
-11. [Complete Service Workflow Examples](#11-complete-service-workflow-examples)
-12. [Comparison: Old vs New](#12-comparison-old-vs-new)
-13. [Migration Guide](#13-migration-guide)
+7. [Template 3 — `_docker-build.yml` (Build + Trivy)](#7-template-3--_docker-buildyml-build--trivy)
+8. [Template 4 — `_docker-publish.yml` (Tag + Push + CD)](#8-template-4--_docker-publishyml-tag--push--cd)
+9. [Template 5 — `_cd-update.yml` (Update Helm Chart)](#9-template-5--_cd-updateyml-update-helm-chart)
+10. [Template 6 — `_notify.yml` (Email Alerts)](#10-template-6--_notifyyml-email-alerts)
+11. [How Service Repos Compose These Templates](#11-how-service-repos-compose-these-templates)
+12. [Complete Service Workflow Examples](#12-complete-service-workflow-examples)
+13. [Comparison: Old vs New](#13-comparison-old-vs-new)
+14. [Migration Guide](#14-migration-guide)
 
 ---
 
@@ -56,72 +57,69 @@ You have `if: inputs.runtime == 'node'` and `if: inputs.runtime == 'python'` sca
 - name: Setup Python
   if: inputs.runtime == 'python'
   ...
-- name: Install Node dependencies
-  if: inputs.runtime == 'node'
-  ...
-- name: Install Python dependencies
-  if: inputs.runtime == 'python'
-  ...
 ```
 
 Every time you add a new runtime (e.g., Go, Rust), you add MORE conditionals everywhere.
 
-### Problem 3: Can't Use Pieces Independently
+### Problem 3: Scanning Happens on Both PR and Push
 
-What if you want to:
-- Run **only** SonarQube on a PR, without building Docker images? You can't.
-- Run **only** Snyk scanning as a scheduled job? You can't.
-- Skip Docker push but still run security scans? Complicated.
+In the current setup, scans run on pushes too — wasting time and GitHub Actions minutes. If you already scanned in the PR, why scan again after merge?
 
-### Problem 4: Hard to Debug
+### Problem 4: Notifications Are Embedded Inside Scan Templates
 
-When the workflow fails, you're looking at a 250-line file with 2 jobs and 25+ steps. Finding the issue is painful.
+Email alert logic is buried inside the scanning and building steps. If you want to change your notification provider (Brevo → Slack → Discord), you'd have to edit multiple files.
 
-### Problem 5: Adding CD Breaks Everything
+### Problem 5: Can't Build-Only-Test the Docker Image on PRs
 
-To add the CD step (updating Helm charts), you'd need to add ANOTHER job with MORE inputs to this already massive file.
+Currently, Docker images are either built+pushed or not built at all. There's no way to build temporarily just to run Trivy on a PR without pushing to Docker Hub.
 
 ---
 
 ## 2. The New Architecture
 
-Break the monolith into **5 small, focused reusable workflows**:
+Break the monolith into **6 small, focused reusable workflows** with a **clear split between PR and Push**:
 
 ```mermaid
 graph TD
     subgraph SHARED["fitforge-shared (Reusable Workflows)"]
         SAST["_sast.yml\n• SonarQube scan\n• Quality gate"]
-        SCA["_sca.yml\n• Snyk scan\n• Report upload\n• Crit check"]
-        DOCKER["_docker-build.yml\n• Semver/dev tag\n• Docker build\n• Trivy scan\n• Push to Hub"]
+        SCA["_sca.yml\n• Snyk scan\n• Report upload\n• Outputs: critical-found"]
+        DOCKER_BUILD["_docker-build.yml\n• Build temp image\n• Trivy scan\n• NO push\n• Outputs: trivy-critical"]
+        DOCKER_PUBLISH["_docker-publish.yml\n• Generate tag (semver/dev)\n• Build image\n• Push to Docker Hub\n• Create Git tag\n• Outputs: image-tag"]
         CD["_cd-update.yml\n• Checkout Helm repo\n• Update values\n• Validate chart\n• Commit + push"]
-        NOTIFY["_notify.yml\n• Brevo email\n• Attach report"]
+        NOTIFY["_notify.yml\n• Brevo email\n• Generic: any caller"]
     end
 
-    subgraph SERVICE["Service Repo (e.g., fitforge-ai-service)"]
-        CALLER["ci-cd.yml\n(Composer workflow)"]
+    subgraph PR_FLOW["PR Event (scan + validate)"]
+        PR_SAST["sast job"] --> PR_BUILD
+        PR_SCA["sca job"] --> PR_BUILD
+        PR_BUILD["build job\n(temp build + Trivy)"] --> PR_NOTIFY
+        PR_NOTIFY["notify job\n(if criticals found)"]
     end
 
-    CALLER -->|"calls"| SAST
-    CALLER -->|"calls"| SCA
-    CALLER -->|"calls"| DOCKER
-    CALLER -->|"calls"| CD
-    SCA -->|"on critical"| NOTIFY
-    DOCKER -->|"on critical"| NOTIFY
+    subgraph PUSH_FLOW["Push Event (build + ship)"]
+        PUSH_PUBLISH["publish job\n(tag + build + push)"] --> PUSH_CD["cd job\n(update Helm chart)"]
+    end
 ```
+
+### The Key Insight: PR ≠ Push
+
+| Event | Purpose | Jobs | Scanning? | Docker Push? | CD? |
+|---|---|---|---|---|---|
+| **Pull Request** | Validate everything before merge | SAST + SCA + Build (temp) + Trivy + Notify | ✅ Yes | ❌ No | ❌ No |
+| **Push (merge)** | Ship the validated code | Publish + CD | ❌ No (already done in PR) | ✅ Yes | ✅ Yes |
 
 ### Sizing Comparison
 
-| Template | Lines (Old) | Lines (New) |
+| Template | Lines | Responsibility |
 |---|---|---|
-| `_ci-template.yml` (monolith) | ~250 | ❌ Deleted |
-| `_sast.yml` | — | ~45 |
-| `_sca.yml` | — | ~80 |
-| `_docker-build.yml` | — | ~100 |
-| `_cd-update.yml` | — | ~70 |
-| `_notify.yml` | — | ~35 |
-| **Total** | **~250 in 1 file** | **~330 across 5 files** |
-
-Yes, the total line count is slightly more. But each file is **small, focused, and testable independently**.
+| `_sast.yml` | ~45 | SonarQube scanning |
+| `_sca.yml` | ~75 | Snyk scanning (NO email) |
+| `_docker-build.yml` | ~55 | Temp build + Trivy (NO push, NO email) |
+| `_docker-publish.yml` | ~90 | Tag + build + push + git tag |
+| `_cd-update.yml` | ~70 | Update Helm chart |
+| `_notify.yml` | ~45 | Email alerts (ALL notifications go through here) |
+| **Total** | **~380** | **6 files, each does ONE thing** |
 
 ---
 
@@ -131,61 +129,79 @@ Yes, the total line count is slightly more. But each file is **small, focused, a
 
 Each workflow does **one thing well**:
 - `_sast.yml` → Static code analysis. That's it.
-- `_sca.yml` → Dependency vulnerability scanning. That's it.
-- `_docker-build.yml` → Build, scan, push Docker images. That's it.
+- `_sca.yml` → Dependency scanning. Outputs results. **Never sends emails.**
+- `_docker-build.yml` → Temp build + Trivy. **Never pushes. Never sends emails.**
+- `_docker-publish.yml` → Tag + build + push. That's it.
+- `_cd-update.yml` → Update Helm chart. That's it.
+- `_notify.yml` → Send emails. **The ONLY place that sends emails.**
 
-### Principle 2: Inputs Are Minimal
+### Principle 2: Scan Once, Ship Fast
 
-Each workflow only asks for what **it** needs. The Docker workflow doesn't need `SONAR_TOKEN`. The SAST workflow doesn't need `DOCKER_USERNAME`.
+- **PR phase**: Do ALL the heavy scanning (SonarQube, Snyk, Trivy). This is the safety gate.
+- **Push phase**: The code was already validated in the PR. Just build, tag, push, and deploy. Fast.
 
 ### Principle 3: Outputs Enable Composition
 
-Workflows pass data to the next workflow via `outputs`:
-- `_docker-build.yml` outputs `image-tag` → `_cd-update.yml` consumes it
-- `_sca.yml` outputs `critical-found` → caller decides whether to notify
+Workflows pass results to the caller via `outputs`:
+- `_sca.yml` outputs `critical-found` → caller decides whether to call `_notify.yml`
+- `_docker-build.yml` outputs `trivy-critical` → caller decides whether to call `_notify.yml`
+- `_docker-publish.yml` outputs `image-tag` → `_cd-update.yml` consumes it
 
-### Principle 4: Runtime Is the Caller's Problem
+### Principle 4: Notifications Are Centralized
 
-Instead of having runtime conditionals inside every template, only `_sca.yml` needs to know about runtime (because Snyk needs the dependencies installed). The other templates don't care if you're running Node, Python, or Go.
+Email logic lives in ONE place: `_notify.yml`. The scanning templates **never** send emails directly. They just output a boolean (`critical-found: true/false`), and the **caller** decides whether to call `_notify.yml`.
+
+**Why?** If you switch from Brevo to Slack tomorrow, you change ONE file instead of three.
 
 ### Principle 5: Fail Fast, Fail Independently
 
-If SonarQube is down, Docker builds still work. If Snyk has an issue, it doesn't block your deployment. You control the dependency chain in the **caller**, not the template.
+If SonarQube is down, Snyk still runs. If Trivy finds criticals, the PR is flagged but not blocked (you decide the policy in the caller).
 
 ---
 
-## 4. The Composition Pattern
+## 4. The Composition Pattern — PR vs Push
 
-Each service repo has a **composer workflow** that calls the templates in order:
+### PR Flow (Scan Everything, Push Nothing)
 
 ```mermaid
 flowchart TD
-    PR{"Is this a PR?"}
-    PUSH{"Is this a push?"}
-
-    PR -->|yes| SAST["_sast.yml\n(SonarQube)"]
-    PR -->|yes| SCA["_sca.yml\n(Snyk)"]
-
-    PUSH -->|yes| SAST2["_sast.yml"]
-    PUSH -->|yes| SCA2["_sca.yml"]
-    PUSH -->|yes| BUILD["_docker-build.yml\n(Build + Trivy + Push)"]
-
-    SAST2 -.->|"optional dependency"| BUILD
-    SCA2 -.->|"optional dependency"| BUILD
-    BUILD -->|"needs: build"| CD["_cd-update.yml\n(Update Helm Chart)"]
+    PR["Pull Request opened/updated"]
+    
+    PR --> SAST["Job: sast\n_sast.yml"]
+    PR --> SCA["Job: sca\n_sca.yml"]
+    PR --> BUILD["Job: build\n_docker-build.yml\n(temp build + Trivy, NO push)"]
+    
+    SCA --> NOTIFY_SCA{"sca.critical-found\n== true?"}
+    BUILD --> NOTIFY_TRIVY{"build.trivy-critical\n== true?"}
+    
+    NOTIFY_SCA -->|yes| NOTIFY1["Job: notify-snyk\n_notify.yml"]
+    NOTIFY_TRIVY -->|yes| NOTIFY2["Job: notify-trivy\n_notify.yml"]
+    
+    NOTIFY_SCA -->|no| DONE["✅ PR is clean"]
+    NOTIFY_TRIVY -->|no| DONE
 ```
 
-Key decisions made in the **caller**:
-- **On PRs**: Run SAST + SCA only (no Docker build, no deploy)
-- **On Push**: Run everything (SAST + SCA + Build + CD)
-- **Dependencies**: You choose which jobs block which
+### Push Flow (Build + Ship, No Scanning)
+
+```mermaid
+flowchart TD
+    PUSH["Push to develop / main\n(merge event)"]
+    
+    PUSH --> PUBLISH["Job: publish\n_docker-publish.yml\n(tag + build + push)"]
+    
+    PUBLISH --> CD["Job: cd\n_cd-update.yml\n(update Helm chart)"]
+```
+
+**Result:**
+- PRs are **thorough** (SAST + SCA + build + Trivy + notify) — your safety gate
+- Pushes are **fast** (just build + push + CD) — no redundant scanning
 
 ---
 
 ## 5. Template 1 — `_sast.yml` (SonarQube)
 
 **Purpose**: Run SonarQube SAST scanning and check the quality gate.  
-**Inputs**: Just the service path and secrets.  
+**Used in**: PR flow only.  
 **Outputs**: Quality gate status.
 
 ```yaml
@@ -245,14 +261,14 @@ jobs:
           echo "status=${{ steps.gate.outcome }}" >> $GITHUB_OUTPUT
 ```
 
-**That's it.** 45 lines. Does one thing. Clean.
-
 ---
 
 ## 6. Template 2 — `_sca.yml` (Snyk)
 
-**Purpose**: Run Snyk dependency vulnerability scanning, generate reports, check for criticals.  
-**Key detail**: This is the **only** template that needs to know about runtime (Node vs Python), because Snyk needs dependencies installed to scan them.
+**Purpose**: Run Snyk dependency scanning, generate reports, check for criticals.  
+**Used in**: PR flow only.  
+**Outputs**: `critical-found` boolean — the **caller** decides what to do with it.  
+**Does NOT send emails** — that's `_notify.yml`'s job.
 
 ```yaml
 # fitforge-shared/.github/workflows/_sca.yml
@@ -278,11 +294,9 @@ on:
     secrets:
       SNYK_TOKEN:
         required: true
-      BREVO_API_KEY:
-        required: false
     outputs:
       critical-found:
-        description: "Whether critical/high vulnerabilities were found"
+        description: "Whether critical/high vulnerabilities were found (true/false)"
         value: ${{ jobs.sca.outputs.critical_found }}
 
 jobs:
@@ -298,7 +312,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # ─── Runtime Setup (Node or Python) ───
+      # ─── Runtime Setup ───
       - name: Setup Node.js
         if: inputs.runtime == 'node'
         uses: actions/setup-node@v4
@@ -352,7 +366,7 @@ jobs:
           path: ${{ inputs.service-path }}/snyk-report.html
           retention-days: 14
 
-      # ─── Critical Check ───
+      # ─── Critical Check (output only, no email!) ───
       - name: Check for Critical Vulnerabilities
         id: snyk-check
         run: |
@@ -363,38 +377,107 @@ jobs:
           else
             echo "critical_found=false" >> $GITHUB_OUTPUT
           fi
-
-      # ─── Alert (only if Brevo key is provided) ───
-      - name: Send Snyk Alert Email (Brevo)
-        if: steps.snyk-check.outputs.critical_found == 'true' && secrets.BREVO_API_KEY != ''
-        run: |
-          REPORT_BASE64=$(base64 -w 0 snyk-report.html)
-          curl --request POST \
-            --url https://api.brevo.com/v3/smtp/email \
-            --header "accept: application/json" \
-            --header "api-key: $BREVO_API_KEY" \
-            --header "content-type: application/json" \
-            --data "{
-              \"sender\": {\"name\": \"CI Pipeline\", \"email\": \"fitforge360.in@gmail.com\"},
-              \"to\": [{\"email\": \"fitforge360.in@gmail.com\"}],
-              \"subject\": \"🚨 Snyk: Critical Vulnerabilities in ${{ inputs.service-name }}\",
-              \"textContent\": \"Critical vulnerabilities found in ${{ inputs.service-name }}. See attached Snyk report.\",
-              \"attachment\": [{\"name\": \"snyk-report.html\", \"content\": \"$REPORT_BASE64\"}]
-            }"
-        env:
-          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 ```
+
+> [!IMPORTANT]
+> Notice: **NO email logic here.** The workflow just outputs `critical-found: true/false`. The caller decides whether to call `_notify.yml`. This keeps the template clean and reusable.
 
 ---
 
-## 7. Template 3 — `_docker-build.yml` (Build + Trivy + Push)
+## 7. Template 3 — `_docker-build.yml` (Build + Trivy)
 
-**Purpose**: Calculate version tag, build Docker image, run Trivy scan, push to Docker Hub, create Git tag.  
-**Key change**: This template doesn't know or care about SonarQube or Snyk. It just builds.
+**Purpose**: Build a **temporary** Docker image (never pushed) and run Trivy vulnerability scan on it.  
+**Used in**: PR flow only.  
+**Outputs**: `trivy-critical` boolean — the **caller** decides whether to notify.  
+**Does NOT push to Docker Hub.** Does NOT send emails.
 
 ```yaml
 # fitforge-shared/.github/workflows/_docker-build.yml
-name: _Docker Build — Build, Scan & Push
+name: _Docker Build — Temp Build + Trivy Scan
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        description: "Service name for image naming and reports"
+        required: true
+        type: string
+      service-path:
+        description: "Path to Dockerfile"
+        required: false
+        type: string
+        default: "."
+    outputs:
+      trivy-critical:
+        description: "Whether CRITICAL vulnerabilities were found in the image (true/false)"
+        value: ${{ jobs.build-scan.outputs.trivy_critical }}
+
+jobs:
+  build-scan:
+    name: Build & Scan Image
+    runs-on: ubuntu-latest
+    outputs:
+      trivy_critical: ${{ steps.trivy_check.outputs.critical_found }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.service-path }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # ─── Build Temp Image (local only, never pushed) ───
+      - name: Build Docker Image (Temp)
+        run: |
+          docker build -t ${{ inputs.service-name }}:pr-test .
+          echo "✅ Temp image built: ${{ inputs.service-name }}:pr-test"
+
+      # ─── Trivy Scan ───
+      - name: Trivy Vulnerability Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ inputs.service-name }}:pr-test"
+          format: "table"
+          output: "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
+          scan-type: "image"
+          severity: "CRITICAL,HIGH"
+          exit-code: "0"
+          ignore-unfixed: true
+          vuln-type: "os,library"
+
+      - name: Upload Trivy Report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-${{ inputs.service-name }}
+          path: "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
+          retention-days: 14
+
+      # ─── Critical Check (output only, no email!) ───
+      - name: Check Trivy for Criticals
+        id: trivy_check
+        run: |
+          if grep -qE "CRITICAL" "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"; then
+            echo "critical_found=true" >> $GITHUB_OUTPUT
+            echo "⚠️ CRITICAL vulnerabilities found!"
+          else
+            echo "critical_found=false" >> $GITHUB_OUTPUT
+            echo "✅ No critical vulnerabilities."
+          fi
+```
+
+> [!NOTE]
+> This template is **lean** — ~55 lines. It builds a throwaway image tagged `pr-test`, runs Trivy, outputs the result, and the image is discarded when the runner shuts down. No Docker Hub credentials needed!
+
+---
+
+## 8. Template 4 — `_docker-publish.yml` (Tag + Push + CD)
+
+**Purpose**: Generate the version tag (semver for main, dev-SHA for develop), build the final Docker image, push to Docker Hub, and create a Git tag. This runs **only on push** (after merge).  
+**No scanning** — that was already done in the PR.
+
+```yaml
+# fitforge-shared/.github/workflows/_docker-publish.yml
+name: _Docker Publish — Tag, Build & Push
 
 on:
   workflow_call:
@@ -417,19 +500,17 @@ on:
         required: true
       DOCKER_PASSWORD:
         required: true
-      BREVO_API_KEY:
-        required: false
     outputs:
       image-tag:
         description: "The Docker image tag that was built and pushed"
-        value: ${{ jobs.build.outputs.tag }}
+        value: ${{ jobs.publish.outputs.tag }}
       image-full:
         description: "Full image reference (registry/name:tag)"
-        value: ${{ jobs.build.outputs.full_image }}
+        value: ${{ jobs.publish.outputs.full_image }}
 
 jobs:
-  build:
-    name: Build & Push
+  publish:
+    name: Publish Image
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.tag.outputs.tag }}
@@ -507,83 +588,33 @@ jobs:
           docker build -t ${{ steps.tag.outputs.full_image }} .
           echo "built=true" >> $GITHUB_OUTPUT
 
-      # ─── Trivy Scan ───
-      - name: Trivy Vulnerability Scan
-        uses: aquasecurity/trivy-action@master
-        if: steps.docker_build.outputs.built == 'true'
-        with:
-          image-ref: ${{ steps.tag.outputs.full_image }}
-          format: "table"
-          output: "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
-          scan-type: "image"
-          severity: "CRITICAL,HIGH"
-          exit-code: "0"
-          ignore-unfixed: true
-          vuln-type: "os,library"
-
-      - name: Upload Trivy Report
-        uses: actions/upload-artifact@v4
-        if: always() && steps.docker_build.outputs.built == 'true'
-        with:
-          name: trivy-${{ inputs.service-name }}
-          path: "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
-          retention-days: 14
-
-      - name: Check Trivy for Criticals
-        id: trivy_check
-        if: steps.docker_build.outputs.built == 'true'
-        run: |
-          if grep -qE "CRITICAL" "${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"; then
-            echo "critical_found=true" >> $GITHUB_OUTPUT
-          else
-            echo "critical_found=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Send Trivy Alert Email (Brevo)
-        if: steps.trivy_check.outputs.critical_found == 'true' && secrets.BREVO_API_KEY != ''
-        run: |
-          REPORT_FILE="${{ github.workspace }}/trivy-report-${{ inputs.service-name }}.txt"
-          REPORT_BASE64=$(base64 -w 0 "$REPORT_FILE")
-          cat > /tmp/brevo-payload.json << PAYLOAD_EOF
-          {
-            "sender": {"name": "CI Pipeline", "email": "fitforge360.in@gmail.com"},
-            "to": [{"email": "fitforge360.in@gmail.com"}],
-            "subject": "🚨 Trivy: Critical Vulnerabilities in ${{ inputs.service-name }}",
-            "textContent": "CRITICAL vulnerabilities found in ${{ inputs.service-name }}. See attached report.",
-            "attachment": [{"name": "trivy-report.txt", "content": "$REPORT_BASE64"}]
-          }
-          PAYLOAD_EOF
-          curl --request POST \
-            --url https://api.brevo.com/v3/smtp/email \
-            --header "accept: application/json" \
-            --header "api-key: $BREVO_API_KEY" \
-            --header "content-type: application/json" \
-            --data @/tmp/brevo-payload.json
-        env:
-          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
-
       # ─── Push Image ───
       - name: Push Docker Image
-        if: steps.docker_build.outputs.built == 'true' && github.event_name != 'pull_request'
-        run: docker push ${{ steps.tag.outputs.full_image }}
+        if: steps.docker_build.outputs.built == 'true'
+        run: |
+          docker push ${{ steps.tag.outputs.full_image }}
+          echo "✅ Pushed: ${{ steps.tag.outputs.full_image }}"
 
       # ─── Create Git Tag ───
       - name: Create Git Tag
-        if: inputs.environment == 'main' && steps.tag_check.outputs.exists != 'true' && github.event_name != 'pull_request'
+        if: inputs.environment == 'main' && steps.tag_check.outputs.exists != 'true'
         run: |
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git tag ${{ steps.tag.outputs.tag }}
           git push origin ${{ steps.tag.outputs.tag }}
+          echo "🏷️ Git tag created: ${{ steps.tag.outputs.tag }}"
 ```
 
-**Critical output**: This workflow outputs `image-tag` which the CD workflow consumes.
+> [!IMPORTANT]
+> Notice: **No Trivy scan here.** The image was already scanned during the PR phase. This workflow is focused purely on publishing — it's fast.
 
 ---
 
-## 8. Template 4 — `_cd-update.yml` (Update Helm Chart)
+## 9. Template 5 — `_cd-update.yml` (Update Helm Chart)
 
-**Purpose**: Take an image tag, update the correct `values-dev.yaml` or `values-prod.yaml` in the Helm repo, validate the chart, commit and push.
+**Purpose**: Take an image tag, update the correct `values-dev.yaml` or `values-prod.yaml` in the Helm repo, validate the chart, commit and push.  
+**Used in**: Push flow only (after `_docker-publish.yml`).
 
 ```yaml
 # fitforge-shared/.github/workflows/_cd-update.yml
@@ -695,16 +726,14 @@ jobs:
 
 ---
 
-## 9. Template 5 — `_notify.yml` (Email Alerts)
+## 10. Template 6 — `_notify.yml` (Email Alerts)
 
-**Purpose**: Generic email notification via Brevo. Can be called from anywhere.
-
-> [!NOTE]
-> This is **optional**. In the templates above, Snyk and Trivy alerts are already built-in. Use this template only if you want a **separate, generic** notification workflow for other purposes (deploy success, failed pipelines, etc.).
+**Purpose**: The **single source of truth** for all email notifications. Every other template outputs results — this one acts on them.  
+**Used in**: PR flow (called by the composer when criticals are found).
 
 ```yaml
 # fitforge-shared/.github/workflows/_notify.yml
-name: _Notify — Email Alert
+name: _Notify — Email Alert (Brevo)
 
 on:
   workflow_call:
@@ -722,16 +751,31 @@ on:
         required: false
         type: string
         default: ""
+      artifact-name:
+        description: "Name of the artifact to download and attach (optional)"
+        required: false
+        type: string
+        default: ""
     secrets:
       BREVO_API_KEY:
         required: true
 
 jobs:
   send-email:
-    name: Send Email
+    name: Send Email Alert
     runs-on: ubuntu-latest
     steps:
-      - name: Send via Brevo
+      # ─── Download Report Artifact (if provided) ───
+      - name: Download Report Artifact
+        if: inputs.artifact-name != ''
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ./report
+
+      # ─── Send Email Without Attachment ───
+      - name: Send Email (No Attachment)
+        if: inputs.artifact-name == ''
         run: |
           curl --request POST \
             --url https://api.brevo.com/v3/smtp/email \
@@ -742,44 +786,76 @@ jobs:
               \"sender\": {\"name\": \"CI/CD Pipeline\", \"email\": \"fitforge360.in@gmail.com\"},
               \"to\": [{\"email\": \"fitforge360.in@gmail.com\"}],
               \"subject\": \"${{ inputs.subject }}\",
-              \"textContent\": \"${{ inputs.body }}\nService: ${{ inputs.service-name }}\nRepo: ${{ github.repository }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+              \"textContent\": \"${{ inputs.body }}\n\nService: ${{ inputs.service-name }}\nRepo: ${{ github.repository }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
             }"
+        env:
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+      # ─── Send Email With Attachment ───
+      - name: Send Email (With Attachment)
+        if: inputs.artifact-name != ''
+        run: |
+          # Find the report file (could be .html or .txt)
+          REPORT_FILE=$(find ./report -type f | head -1)
+          REPORT_NAME=$(basename "$REPORT_FILE")
+          REPORT_BASE64=$(base64 -w 0 "$REPORT_FILE")
+
+          cat > /tmp/brevo-payload.json << PAYLOAD_EOF
+          {
+            "sender": {"name": "CI/CD Pipeline", "email": "fitforge360.in@gmail.com"},
+            "to": [{"email": "fitforge360.in@gmail.com"}],
+            "subject": "${{ inputs.subject }}",
+            "textContent": "${{ inputs.body }}\n\nService: ${{ inputs.service-name }}\nRepo: ${{ github.repository }}\nRun: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "attachment": [{"name": "$REPORT_NAME", "content": "$REPORT_BASE64"}]
+          }
+          PAYLOAD_EOF
+
+          curl --request POST \
+            --url https://api.brevo.com/v3/smtp/email \
+            --header "accept: application/json" \
+            --header "api-key: $BREVO_API_KEY" \
+            --header "content-type: application/json" \
+            --data @/tmp/brevo-payload.json
         env:
           BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 ```
 
+> [!TIP]
+> This template can **download artifacts** uploaded by `_sca.yml` or `_docker-build.yml` and attach them to the email. Pass the artifact name (e.g., `snyk-report-ai-service` or `trivy-ai-service`) and it handles everything.
+
 ---
 
-## 10. How Service Repos Compose These Templates
+## 11. How Service Repos Compose These Templates
 
-This is the **key insight**. Each service repo has ONE workflow file that **composes** the templates like Lego blocks:
+Each service repo has **ONE workflow file** that composes all templates. The flow is split cleanly between PR and Push:
 
 ```mermaid
 flowchart TD
-    subgraph SERVICE_WORKFLOW["ci-cd.yml in fitforge-ai-service"]
+    subgraph PR_PHASE["PR Phase — Scan + Validate"]
         direction TB
-        A["on: push / pull_request"]
+        SAST["sast\n_sast.yml"] 
+        SCA["sca\n_sca.yml"]
+        BUILD["build\n_docker-build.yml\n(temp image + Trivy)"]
         
-        A --> SAST_JOB["Job 1: sast\ncalls _sast.yml"]
-        A --> SCA_JOB["Job 2: sca\ncalls _sca.yml"]
+        SCA --> CHECK_SCA{"criticals?"}
+        BUILD --> CHECK_TRIVY{"criticals?"}
         
-        SAST_JOB -.->|"optional"| BUILD_JOB
-        SCA_JOB -.->|"optional"| BUILD_JOB
+        CHECK_SCA -->|yes| NOTIFY_S["notify-snyk\n_notify.yml"]
+        CHECK_TRIVY -->|yes| NOTIFY_T["notify-trivy\n_notify.yml"]
+    end
+
+    subgraph PUSH_PHASE["Push Phase — Build + Ship"]
+        direction TB
+        PUBLISH["publish\n_docker-publish.yml\n(tag + push)"]
+        CD["cd\n_cd-update.yml\n(update Helm chart)"]
         
-        BUILD_JOB["Job 3: build\ncalls _docker-build.yml\n(only on push)"]
-        BUILD_JOB -->|"needs + image-tag"| CD_JOB["Job 4: cd\ncalls _cd-update.yml\n(only on push)"]
+        PUBLISH --> CD
     end
 ```
 
-The **caller controls**:
-- Which jobs run on PRs vs pushes
-- Which jobs depend on which
-- Whether a failing scan blocks the build
-- What inputs/secrets are passed
-
 ---
 
-## 11. Complete Service Workflow Examples
+## 12. Complete Service Workflow Examples
 
 ### Example A: Python Service (AI Service)
 
@@ -797,8 +873,13 @@ permissions:
   contents: write
 
 jobs:
-  # ─── Job 1: SAST (SonarQube) ───
+  # ╔══════════════════════════════════════════════╗
+  # ║         PR PHASE — Scan + Validate           ║
+  # ╚══════════════════════════════════════════════╝
+
+  # ─── SAST (SonarQube) ───
   sast:
+    if: github.event_name == 'pull_request'
     uses: fitforge101/fitforge-shared/.github/workflows/_sast.yml@main
     with:
       service-path: .
@@ -806,8 +887,9 @@ jobs:
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_URL: ${{ secrets.SONAR_URL }}
 
-  # ─── Job 2: SCA (Snyk) ───
+  # ─── SCA (Snyk) ───
   sca:
+    if: github.event_name == 'pull_request'
     uses: fitforge101/fitforge-shared/.github/workflows/_sca.yml@main
     with:
       service-name: ai-service
@@ -815,17 +897,49 @@ jobs:
       runtime: python
     secrets:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+
+  # ─── Temp Docker Build + Trivy ───
+  build:
+    if: github.event_name == 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@main
+    with:
+      service-name: ai-service
+      service-path: .
+
+  # ─── Notify: Snyk Criticals ───
+  notify-snyk:
+    needs: [sca]
+    if: needs.sca.outputs.critical-found == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@main
+    with:
+      subject: "🚨 Snyk: Critical Vulnerabilities in ai-service"
+      body: "Critical/High vulnerabilities found in ai-service dependencies."
+      service-name: ai-service
+      artifact-name: snyk-report-ai-service
+    secrets:
       BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
-  # ─── Job 3: Build + Push Docker Image ───
-  build:
-    needs: [sast, sca]
-    if: >
-      always() &&
-      needs.sast.result != 'failure' &&
-      needs.sca.result != 'failure' &&
-      github.event_name == 'push'
-    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@main
+  # ─── Notify: Trivy Criticals ───
+  notify-trivy:
+    needs: [build]
+    if: needs.build.outputs.trivy-critical == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@main
+    with:
+      subject: "🚨 Trivy: Critical Vulnerabilities in ai-service"
+      body: "CRITICAL vulnerabilities found in ai-service Docker image."
+      service-name: ai-service
+      artifact-name: trivy-ai-service
+    secrets:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  # ╔══════════════════════════════════════════════╗
+  # ║         PUSH PHASE — Build + Ship            ║
+  # ╚══════════════════════════════════════════════╝
+
+  # ─── Publish Docker Image ───
+  publish:
+    if: github.event_name == 'push'
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-publish.yml@main
     with:
       service-name: ai-service
       service-path: .
@@ -833,16 +947,15 @@ jobs:
     secrets:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
-  # ─── Job 4: Update Helm Chart (CD) ───
+  # ─── Update Helm Chart (CD) ───
   cd:
-    needs: [build]
-    if: needs.build.result == 'success'
+    needs: [publish]
+    if: needs.publish.result == 'success'
     uses: fitforge101/fitforge-shared/.github/workflows/_cd-update.yml@main
     with:
       service-name: ai-service
-      image-tag: ${{ needs.build.outputs.image-tag }}
+      image-tag: ${{ needs.publish.outputs.image-tag }}
       environment: ${{ github.ref_name }}
     secrets:
       HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
@@ -864,7 +977,9 @@ permissions:
   contents: write
 
 jobs:
+  # ── PR Phase ──
   sast:
+    if: github.event_name == 'pull_request'
     uses: fitforge101/fitforge-shared/.github/workflows/_sast.yml@main
     with:
       service-path: .
@@ -873,23 +988,50 @@ jobs:
       SONAR_URL: ${{ secrets.SONAR_URL }}
 
   sca:
+    if: github.event_name == 'pull_request'
     uses: fitforge101/fitforge-shared/.github/workflows/_sca.yml@main
     with:
       service-name: user-service
       service-path: .
-      runtime: node                          # ← Only difference from Python!
+      runtime: node                            # ← Only difference from Python!
     secrets:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
   build:
-    needs: [sast, sca]
-    if: >
-      always() &&
-      needs.sast.result != 'failure' &&
-      needs.sca.result != 'failure' &&
-      github.event_name == 'push'
+    if: github.event_name == 'pull_request'
     uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@main
+    with:
+      service-name: user-service
+      service-path: .
+
+  notify-snyk:
+    needs: [sca]
+    if: needs.sca.outputs.critical-found == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@main
+    with:
+      subject: "🚨 Snyk: Critical Vulnerabilities in user-service"
+      body: "Critical/High vulnerabilities found in user-service dependencies."
+      service-name: user-service
+      artifact-name: snyk-report-user-service
+    secrets:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  notify-trivy:
+    needs: [build]
+    if: needs.build.outputs.trivy-critical == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/_notify.yml@main
+    with:
+      subject: "🚨 Trivy: Critical Vulnerabilities in user-service"
+      body: "CRITICAL vulnerabilities found in user-service Docker image."
+      service-name: user-service
+      artifact-name: trivy-user-service
+    secrets:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  # ── Push Phase ──
+  publish:
+    if: github.event_name == 'push'
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-publish.yml@main
     with:
       service-name: user-service
       service-path: .
@@ -897,119 +1039,115 @@ jobs:
     secrets:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
   cd:
-    needs: [build]
-    if: needs.build.result == 'success'
+    needs: [publish]
+    if: needs.publish.result == 'success'
     uses: fitforge101/fitforge-shared/.github/workflows/_cd-update.yml@main
     with:
       service-name: user-service
-      image-tag: ${{ needs.build.outputs.image-tag }}
+      image-tag: ${{ needs.publish.outputs.image-tag }}
       environment: ${{ github.ref_name }}
     secrets:
       HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
 ```
 
 > [!TIP]
-> Notice how the Node.js and Python workflows are **almost identical**. The only difference is `runtime: node` vs `runtime: python` and the `service-name`. The templates handle everything else.
+> The service workflows for Node.js and Python are **almost identical**. Only `runtime: node` vs `runtime: python` and the `service-name` differ.
 
 ---
 
-## 12. Comparison: Old vs New
+## 13. Comparison: Old vs New
 
 ### Architecture
 
 | Aspect | Old (Monolithic) | New (Modular) |
 |---|---|---|
-| **Files in shared repo** | 1 massive file | 5 small files |
-| **Lines per file** | ~250 | ~35-100 each |
-| **Responsibilities per file** | 12+ | 1-2 |
-| **Adding a new runtime** | Touch 6+ conditionals | Only change `_sca.yml` |
-| **Adding CD step** | Modify the monolith | Add new `_cd-update.yml` |
-| **Debugging** | Scroll through 250 lines | Open the 40-line file that failed |
-| **Testing independently** | Impossible | Call any template alone |
-| **PR-only scanning** | Mix of `if` conditions | Just don't call `build` and `cd` jobs |
+| **Files in shared repo** | 1 massive file | 6 small files |
+| **Scanning on push** | ✅ Redundant (scans twice) | ❌ Skip (already done in PR) |
+| **Docker build on PR** | ❌ No Trivy on PRs | ✅ Temp build + Trivy scan |
+| **Notifications** | Embedded in 2 templates | Centralized in `_notify.yml` |
+| **Push speed** | Slow (scans again) | Fast (just build + push + CD) |
+| **Adding Slack** | Edit 3 files | Edit 1 file (`_notify.yml`) |
+| **Debugging** | Scroll 250 lines | Open the ~50-line file that failed |
 
 ### Data Flow
 
 ```
-OLD WAY:
-  Service Repo → _ci-template.yml (does everything, outputs nothing useful)
+PR EVENT:
+  _sast.yml    → outputs: quality-gate
+  _sca.yml     → outputs: critical-found → _notify.yml (if critical)
+  _docker-build.yml → outputs: trivy-critical → _notify.yml (if critical)
 
-NEW WAY:
-  Service Repo → _sast.yml         → outputs: quality-gate
-               → _sca.yml          → outputs: critical-found
-               → _docker-build.yml → outputs: image-tag, image-full
-               → _cd-update.yml    (consumes image-tag from build)
+PUSH EVENT (after merge):
+  _docker-publish.yml → outputs: image-tag, image-full
+  _cd-update.yml      (consumes image-tag from publish)
 ```
 
-### Flexibility Examples
+### GitHub Actions Minutes Saved
 
-| Scenario | Old Template | New Templates |
-|---|---|---|
-| Run only SAST on a PR | Can't (builds Docker too) | Just call `_sast.yml` |
-| Skip Snyk but still build | Can't (they're in same job) | Don't call `_sca.yml` |
-| Add a Go microservice | Add Go conditionals everywhere | Only add Go logic to `_sca.yml` |
-| Change Docker registry | Edit the monolith | Only edit `_docker-build.yml` |
-| Add Slack notifications | Add to the monolith | Create a new `_notify-slack.yml` |
-| Run Trivy on a schedule | Can't easily | Call `_docker-build.yml` from a cron workflow |
+| Scenario | Old | New | Savings |
+|---|---|---|---|
+| PR created | ~8 min (SAST + SCA) | ~10 min (SAST + SCA + Trivy) | -2 min (more thorough!) |
+| PR merged (push) | ~8 min (SAST + SCA + Build + Push) | ~3 min (Build + Push + CD only) | **5 min saved** |
+| **Total per feature** | **~16 min** | **~13 min** | **~20% faster** |
+
+The push phase is **much faster** because you skip all scanning.
 
 ---
 
-## 13. Migration Guide
+## 14. Migration Guide
 
-### Step 1: Create the New Templates (Don't Delete the Old One Yet!)
+### Step 1: Create the New Templates
 
-In `fitforge-shared`, create all 5 new workflow files alongside the existing `_ci-template.yml`:
+In `fitforge-shared`, create all 6 new workflow files alongside the existing `_ci-template.yml`:
 
 ```
 fitforge-shared/.github/workflows/
-├── _ci-template.yml        ← OLD (keep for now)
-├── _sast.yml               ← NEW
-├── _sca.yml                ← NEW
-├── _docker-build.yml       ← NEW
-├── _cd-update.yml          ← NEW
-└── _notify.yml             ← NEW (optional)
+├── _ci-template.yml          ← OLD (keep for now during migration)
+├── _sast.yml                 ← NEW
+├── _sca.yml                  ← NEW
+├── _docker-build.yml         ← NEW (temp build + Trivy, NO push)
+├── _docker-publish.yml       ← NEW (tag + build + push)
+├── _cd-update.yml            ← NEW
+└── _notify.yml               ← NEW
 ```
 
 ### Step 2: Migrate One Service at a Time
 
-Start with a **low-risk** service (e.g., `fitforge-ai-service` since it's the one you're actively working on):
+Start with `fitforge-ai-service`:
 
-1. Create the new `ci-cd.yml` in the service repo (using the composer pattern)
-2. Delete (or rename) the old `ci-ai-service.yml`
-3. Push to `develop` and test
-4. If it works, migrate the next service
+1. Create the new `ci-cd.yml` in the service repo
+2. Rename the old `ci-ai-service.yml` to `ci-ai-service.yml.bak`
+3. Open a PR to `develop` — this tests the PR flow!
+4. Merge the PR — this tests the Push flow!
+5. If both work, delete the `.bak` file
+6. Repeat for the next service
 
-### Step 3: Once All Services Are Migrated
+### Step 3: Delete the Old Template
 
-Delete the old `_ci-template.yml` from `fitforge-shared`.
-
-### Step 4: Update the CD Walkthrough
-
-Your ArgoCD walkthrough already references `_cd-template.yml`. The new name is `_cd-update.yml`. The behavior is the same.
+Once ALL services are migrated, delete `_ci-template.yml` from `fitforge-shared`.
 
 ---
 
-## Quick Reference: File Locations
+## Quick Reference: All Workflow Files
 
-| File | Location | Purpose |
-|---|---|---|
-| `_sast.yml` | `fitforge-shared/.github/workflows/` | SonarQube scanning |
-| `_sca.yml` | `fitforge-shared/.github/workflows/` | Snyk scanning |
-| `_docker-build.yml` | `fitforge-shared/.github/workflows/` | Build + Trivy + Push |
-| `_cd-update.yml` | `fitforge-shared/.github/workflows/` | Update Helm chart |
-| `_notify.yml` | `fitforge-shared/.github/workflows/` | Email alerts |
-| `ci-cd.yml` | `fitforge-<service>/.github/workflows/` | Composer (per service) |
-
----
+| File | Location | Trigger | Purpose |
+|---|---|---|---|
+| `_sast.yml` | `fitforge-shared` | PR only | SonarQube scan |
+| `_sca.yml` | `fitforge-shared` | PR only | Snyk scan (outputs: `critical-found`) |
+| `_docker-build.yml` | `fitforge-shared` | PR only | Temp build + Trivy (outputs: `trivy-critical`) |
+| `_docker-publish.yml` | `fitforge-shared` | Push only | Tag + build + push (outputs: `image-tag`) |
+| `_cd-update.yml` | `fitforge-shared` | Push only | Update Helm chart |
+| `_notify.yml` | `fitforge-shared` | Conditional | Email alert (called when criticals found) |
+| `ci-cd.yml` | Each service repo | PR + Push | Composer that calls the above |
 
 ## Quick Reference: Workflow Outputs
 
-| Workflow | Output Name | Value | Consumed By |
+| Workflow | Output Name | Type | Consumed By |
 |---|---|---|---|
-| `_sast.yml` | `quality-gate` | `success` or `failure` | Caller's `if` condition |
-| `_sca.yml` | `critical-found` | `true` or `false` | Caller's `if` condition |
-| `_docker-build.yml` | `image-tag` | e.g., `dev-abc1234` or `ai-service-v1.0.5` | `_cd-update.yml` |
-| `_docker-build.yml` | `image-full` | e.g., `aswindevs/ai-service:dev-abc1234` | Any consumer |
+| `_sast.yml` | `quality-gate` | `success` / `failure` | Caller's `if` condition |
+| `_sca.yml` | `critical-found` | `true` / `false` | Caller → `_notify.yml` |
+| `_docker-build.yml` | `trivy-critical` | `true` / `false` | Caller → `_notify.yml` |
+| `_docker-publish.yml` | `image-tag` | e.g., `dev-abc1234` | `_cd-update.yml` |
+| `_docker-publish.yml` | `image-full` | e.g., `aswindevs/ai-service:dev-abc1234` | Any consumer |
