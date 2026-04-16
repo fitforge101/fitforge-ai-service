@@ -1,0 +1,78 @@
+name: AI Service
+
+on:
+  push:
+    branches: 
+      - main
+      - develop
+    # paths:
+    #   - "services/service-x/**"
+  pull_request:
+    branches: 
+      - main
+      - develop
+    # paths:
+    #   - "services/service-x/**"
+
+jobs:
+  code-quality:
+    if: github.event_name == 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-sast-sca.yml
+    with:
+      service-name: ai-service
+      service-path: .
+      runtime: node
+    secrets:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_URL: ${{ secrets.SONAR_URL }}
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  build-image:
+    needs: [code-quality]
+    if: always() && needs.code-quality.result != 'failure' && needs.code-quality.result != 'cancelled'
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-build-image.yml
+    with:
+      service-name: ai-service
+      service-path: .
+      environment: ${{ github.ref_name }} # Branch name
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  trivy-scan:
+    needs: [build-image]
+    if: needs.build-image.outputs.already_exists != 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-trivy-scan.yml
+    with:
+      service-name: ai-service
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      artifact_name: ${{ needs.build-image.outputs.artifact_name }}
+    secrets:
+      BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+
+  push-image:
+    needs: [build-image, trivy-scan]
+    if: |
+      always() &&
+      needs.build-image.outputs.already_exists != 'true' &&
+      needs.trivy-scan.outputs.critical_found != 'true' &&
+      needs.trivy-scan.result == 'success' &&
+      github.event_name != 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-push-image.yml
+    with:
+      service-name: ai-service
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      artifact_name: ${{ needs.build-image.outputs.artifact_name }}
+    secrets:
+      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+
+  tag-release:
+    needs: [build-image, push-image]
+    if: github.ref_name == 'main' && needs.push-image.result == 'success'
+    uses: fitforge101/fitforge-shared/.github/workflows/ci-tag-release.yml
+    with:
+      service-name: ai-service
+      service-path: .
+      image_tag: ${{ needs.build-image.outputs.image_tag }}
