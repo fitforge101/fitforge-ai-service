@@ -1,18 +1,10 @@
-name: AI Service
+name: Ai Service
 
 on:
   push:
-    branches: 
-      - main
-      - develop
-    # paths:
-    #   - "services/service-x/**"
+    branches: [main, dev]
   pull_request:
-    branches: 
-      - main
-      - develop
-    # paths:
-    #   - "services/service-x/**"
+    branches: [main, dev]
 
 jobs:
   code-quality:
@@ -21,58 +13,31 @@ jobs:
     with:
       service-name: ai-service
       service-path: .
-      runtime: node
+      runtime: python
     secrets:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
       SONAR_URL: ${{ secrets.SONAR_URL }}
       BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
-  build-image:
+  build-publish:
     needs: [code-quality]
     if: always() && needs.code-quality.result != 'failure' && needs.code-quality.result != 'cancelled'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-build-image.yml@feature/ci-template-split
+    uses: fitforge101/fitforge-shared/.github/workflows/build-publish.yml@feature/ci-template-split
     with:
       service-name: ai-service
       service-path: .
-      environment: ${{ github.ref_name }} # Branch name
+      environment: ${{ github.ref_name }}
     secrets:
       DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-
-  trivy-scan:
-    needs: [build-image]
-    if: needs.build-image.outputs.already_exists != 'true'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-trivy-scan.yml@feature/ci-template-split
-    with:
-      service-name: ai-service
-      image_tag: ${{ needs.build-image.outputs.image_tag }}
-      artifact_name: ${{ needs.build-image.outputs.artifact_name }}
-    secrets:
       BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
-  push-image:
-    needs: [build-image, trivy-scan]
-    if: |
-      always() &&
-      needs.build-image.outputs.already_exists != 'true' &&
-      needs.trivy-scan.outputs.critical_found != 'true' &&
-      needs.trivy-scan.result == 'success' &&
-      github.event_name != 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-push-image.yml@feature/ci-template-split
-    with:
-      service-name: ai-service
-      image_tag: ${{ needs.build-image.outputs.image_tag }}
-      artifact_name: ${{ needs.build-image.outputs.artifact_name }}
-    secrets:
-      DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
-      DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
-
   tag-release:
-    needs: [build-image, push-image]
-    if: github.ref_name == 'main' && needs.push-image.result == 'success'
-    uses: fitforge101/fitforge-shared/.github/workflows/ci-tag-release.yml@feature/ci-template-split
+    needs: [build-publish]
+    if: github.ref_name == 'main' && needs.build-publish.outputs.built == 'true'
+    uses: fitforge101/fitforge-shared/.github/workflows/tag-release.yml@feature/ci-template-split
     with:
       service-name: ai-service
       service-path: .
-      image_tag: ${{ needs.build-image.outputs.image_tag }}
+      image_tag: ${{ needs.build-publish.outputs.image_tag }}
