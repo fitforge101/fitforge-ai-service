@@ -25,6 +25,7 @@ jobs:
 
   # ─── SCA (Snyk) ───
   sca:
+    needs: [sast]
     if: github.event_name == 'pull_request'
     uses: fitforge101/fitforge-shared/.github/workflows/_sca.yml@feature/templates
     with:
@@ -33,14 +34,6 @@ jobs:
       runtime: python
     secrets:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-
-  # ─── Temp Docker Build + Trivy Scan ───
-  build:
-    if: github.event_name == 'pull_request'
-    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@feature/templates
-    with:
-      service-name: ai-service
-      service-path: .
 
   # ─── Notify: Snyk Criticals ───
   notify-snyk:
@@ -55,6 +48,15 @@ jobs:
     secrets:
       BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
 
+  # ─── Temp Docker Build + Trivy Scan ───
+  build:
+    needs: [sast, sca]
+    if: github.event_name == 'pull_request'
+    uses: fitforge101/fitforge-shared/.github/workflows/_docker-build.yml@feature/templates
+    with:
+      service-name: ai-service
+      service-path: .
+
   # ─── Notify: Trivy Criticals ───
   notify-trivy:
     needs: [build]
@@ -67,7 +69,6 @@ jobs:
       artifact-name: trivy-ai-service
     secrets:
       BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
-
 
   # ─── Publish Docker Image (Tag + Build + Push) ───
   publish:
