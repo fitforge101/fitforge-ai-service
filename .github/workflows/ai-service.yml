@@ -13,7 +13,7 @@ jobs:
     with:
       service-name: ai-service
       service-path: .
-      runtime: node
+      runtime: python
     secrets:
       SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
       SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
