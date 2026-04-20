@@ -83,14 +83,14 @@ jobs:
       DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
 
   # ─── Update Helm Chart (CD) ───
-  # cd:
-  #   needs: [publish]
-  #   if: needs.publish.result == 'success'
-  #   uses: fitforge101/fitforge-shared/.github/workflows/_cd-update.yml@main
-  #   with:
-  #     service-name: ai-service
-  #     image-tag: ${{ needs.publish.outputs.image-tag }}
-  #     environment: ${{ github.ref_name }}
-  #   secrets:
-  #     HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
-  ########
+  cd:
+    needs: [publish]
+    if: needs.publish.result == 'success'
+    uses: fitforge101/fitforge-shared/.github/workflows/_cd-template.yml@feature/template
+    with:
+      service-name: ai-service
+      image-tag: ${{ needs.publish.outputs.image-tag }}
+      environment: ${{ github.ref_name }}
+    secrets:
+      HELM_REPO_PAT: ${{ secrets.HELM_REPO_PAT }}
+  #######
